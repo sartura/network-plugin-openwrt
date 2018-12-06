@@ -60,7 +60,7 @@ single_space(char *str)
 
 
 int
-openwrt_rap(json_object *ret)
+openwrt_rap(json_object **ret)
 {
     int rc = SR_ERR_OK;
     FILE *arptable;
@@ -98,7 +98,8 @@ openwrt_rap(json_object *ret)
 
     char *str = blobmsg_format_json(bb.head, true);
     CHECK_NULL_MSG(str, &rc, cleanup, "failed blobmsg_get_string()");
-    ret = json_tokener_parse(str);
+    *ret = json_tokener_parse(str);
+    free(str);
     CHECK_NULL_MSG(ret, &rc, cleanup, "failed json_tokener_parse()");
 
 cleanup:
@@ -106,7 +107,7 @@ cleanup:
 }
 
 int
-openwrt_ipv6_neigh(json_object *ret)
+openwrt_ipv6_neigh(json_object **ret)
 {
     int rc = SR_ERR_OK;
     FILE *ipv6nghtable;
@@ -143,7 +144,8 @@ openwrt_ipv6_neigh(json_object *ret)
 
     char *str = blobmsg_format_json(bb.head, true);
     CHECK_NULL_MSG(str, &rc, cleanup, "failed blobmsg_get_string()");
-    ret = json_tokener_parse(str);
+    *ret = json_tokener_parse(str);
+    free(str);
     CHECK_NULL_MSG(ret, &rc, cleanup, "failed json_tokener_parse()");
 
 cleanup:
