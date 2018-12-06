@@ -584,8 +584,47 @@ network_operational_ip(priv_t *p_data, char *interface_name, struct list_head *l
         list_add(&list_value->head, list);
     }
 
+    json_object_object_get_ex(p_data->ll, "ll_address", &ip_obj);
+    if (!ip_obj)
+        return rc;
+
+    const int LL6 = json_object_array_length(ip_obj);
+    for (j = 0; j < LL6; j++) {
+        const char *address, *device;
+        struct json_object *d, *a, *p;
+        struct json_object *t = json_object_array_get_idx(ip_obj, j);
+        if (!t)
+            continue;
+
+        json_object_object_get_ex(t, "device", &d);
+        if (!d)
+            continue;
+        device = json_object_get_string(d);
+        if (!is_l3_member(p_data->i, p_data->d, interface_name, (char *) device))
+            continue;
+
+        json_object_object_get_ex(t, "ip6addr", &a);
+        if (!a)
+            continue;
+        address = json_object_get_string(a);
+        json_object_object_get_ex(t, "prefix", &p);
+        if (!p)
+            continue;
+        prefix_length = (uint8_t) json_object_get_int(p);
+
+        const char *fmt = "/ietf-interfaces:interfaces-state/interface[name='%s']/ietf-ip:ipv6/address[ip='%s']/prefix-length";
+        sprintf(xpath, fmt, interface_name, address);
+        list_value = calloc(1, sizeof *list_value);
+        sr_new_values(1, &list_value->value);
+        sr_val_set_xpath(list_value->value, xpath);
+        list_value->value->type = SR_UINT8_T;
+        list_value->value->data.uint8_val = prefix_length;
+        list_add(&list_value->head, list);
+    }
+
     return rc;
 }
+
 
 static int
 network_operational_neigh6(priv_t *p_data, char *interface_name, struct list_head *list)

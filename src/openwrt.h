@@ -26,5 +26,6 @@
 
 int openwrt_rap(json_object *);
 int openwrt_ipv6_neigh(json_object *);
+int openwrt_ipv6_link_local_address(json_object **);
 
 #endif /* OPENWRT_H */
