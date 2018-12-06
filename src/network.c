@@ -411,7 +411,7 @@ parse_network_config(sr_ctx_t *ctx)
         snprintf(ucipath, MAX_UCI_PATH, "network.%s.netmask", name);
         rc = get_uci_item(ctx->uctx, ucipath, &value);
         if (rc == UCI_OK) {
-            xpath = new_path_keys(fmt_ip, name, interface, value, "netmask");
+            xpath = new_path_keys(fmt_ip, name, interface, ipaddr, "netmask");
             rc = sr_set_item_str(ctx->startup_sess, xpath, value, SR_EDIT_DEFAULT);
             del_path_key(&xpath);
             free(value);
@@ -422,7 +422,7 @@ parse_network_config(sr_ctx_t *ctx)
             if (rc != UCI_OK)
                 value = dhcpv6 ? strdup("64") : strdup("24");
 
-            xpath = new_path_keys(fmt_ip, name, interface, value, "prefix-length");
+            xpath = new_path_keys(fmt_ip, name, interface, ipaddr, "prefix-length");
             rc = sr_set_item_str(ctx->startup_sess, xpath, value, SR_EDIT_DEFAULT);
             del_path_key(&xpath);
             free(value);
