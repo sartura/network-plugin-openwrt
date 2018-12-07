@@ -100,7 +100,7 @@ openwrt_rap(json_object **ret)
     CHECK_NULL_MSG(str, &rc, cleanup, "failed blobmsg_get_string()");
     *ret = json_tokener_parse(str);
     free(str);
-    CHECK_NULL_MSG(ret, &rc, cleanup, "failed json_tokener_parse()");
+    CHECK_NULL_MSG(*ret, &rc, cleanup, "failed json_tokener_parse()");
 
 cleanup:
     return rc;
@@ -146,15 +146,13 @@ openwrt_ipv6_neigh(json_object **ret)
     CHECK_NULL_MSG(str, &rc, cleanup, "failed blobmsg_get_string()");
     *ret = json_tokener_parse(str);
     free(str);
-    CHECK_NULL_MSG(ret, &rc, cleanup, "failed json_tokener_parse()");
+    CHECK_NULL_MSG(*ret, &rc, cleanup, "failed json_tokener_parse()");
 
 cleanup:
     return rc;
 }
 
-/* get IPv6 link layer addresses
- * requires OpenWrt package ip-full
- */
+/* get IPv6 link layer and global addresses */
 int
 openwrt_ipv6_link_local_address(json_object **ret)
 {
@@ -162,25 +160,22 @@ openwrt_ipv6_link_local_address(json_object **ret)
     FILE *ip_a;
     void *t, *a;
     char line[512];
-    char device[16];
+    char rest[512];
+    char device[128];
     char ip6addr[132];
-    int prefix;
+    int prefix, item;
 
-    if ((ip_a = popen("ip -6 -br addr", "r"))) {
+    if ((ip_a = popen("ip -6 addr", "r"))) {
         blob_buf_init(&bb, 0);
         a = blobmsg_open_array(&bb, "ll_address");
         while(fgets(line, sizeof(line), ip_a) != NULL) {
             remove_newline(line);
-            if ((sscanf(single_space(line), "%s UP %[^/]/%u", device, ip6addr, &prefix) == 3) ||
-               (sscanf(single_space(line), "%s DOWN %[^/]/%u", device, ip6addr, &prefix) == 3) ||
-               (sscanf(single_space(line), "%s UNKNOWN %[^/]/%u", device, ip6addr, &prefix) == 3) ||
-               (sscanf(single_space(line), "%s %[^/]/%u", device, ip6addr, &prefix) == 3)) {
+            if (sscanf(single_space(line), "%d: %[^:@] %s", &item, device, rest) == 3) {
+            } else if (sscanf(single_space(line), " inet6 %[^/]/%u scope link", ip6addr, &prefix) == 2) {
                 t = blobmsg_open_table(&bb, NULL);
+                blobmsg_add_string(&bb,"device", device);
                 blobmsg_add_string(&bb,"ip6addr", ip6addr);
                 blobmsg_add_u16(&bb,"prefix", prefix);
-                if (sscanf(single_space(line), "%s %s", device, ip6addr) == 2) {
-                    blobmsg_add_string(&bb,"device", device);
-                }
                 blobmsg_close_table(&bb, t);
             }
         }
