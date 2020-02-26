@@ -441,7 +441,7 @@ static int parse_network_config(sr_ctx_t *ctx) {
   }
 
   INF_MSG("commit the sysrepo changes");
-  rc = sr_apply_changes(ctx->startup_sess, 0);
+  rc = sr_apply_changes(ctx->startup_sess, 0, 0);
   CHECK_RET(rc, error, "Couldn't apply changes initial interfaces: %s",
             sr_strerror(rc));
 
