@@ -22,26 +22,34 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 
+#include <libubus.h>
+#include <libubox/blobmsg.h>
+#include <libubox/blobmsg_json.h>
+#include <json-c/json.h>
+
 #include <sysrepo.h>
 #include <sysrepo/values.h>
-#include <sysrepo/xpath.h>
 
-#include "sr_uci.h"
-#include "uci.h"
+#include "terastream.h"
 
-#define MAX_UCI_PATH 64
 #define MAX_XPATH 256
 
-#define ARR_SIZE(a) sizeof a / sizeof a[0]
+struct value_node {
+    struct list_head head;
+    sr_val_t *value;
+};
 
-typedef struct priv_s {
-  json_object *i;  // ubus call network.interface dump
-  json_object *d;  // ubus call network.device status
-  json_object *a;  // ubus call router.net arp
-  json_object *n;  // ubus call router.net ipv6_neigh
-  json_object *ll; // get link local IPv6 addresses
-  json_object *tmp;
-  bool terastream; // is the terastream YANG model installed
-} priv_t;
+typedef void (*ubus_val_to_sr_val)(priv_t *, char *, struct list_head *list);
+typedef void (*sfp_ubus_val_to_sr_val)(struct json_object *, struct list_head *list);
+
+int network_operational_start();
+void network_operational_stop();
+
+int operstatus_transform(priv_t *, char *, struct list_head *);
+
+int sfp_state_data(struct list_head *);
+
+int phy_interfaces_state_cb(priv_t *, char *, struct list_head *);
+int sfp_data_cb(struct json_object *, struct list_head *);
 
 #endif /* NETWORK_H */

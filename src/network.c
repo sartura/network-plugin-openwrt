@@ -1,798 +1,624 @@
-/**
- * @file network.c
- * @author Mislav Novakovic <mislav.novakovic@sartur.hr>
- * @brief Sysrepo plugin for ietf-interfaces.
- *
- * @copyright
- * Copyright (C) 2018 Deutsche Telekom AG.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *	http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 #include <inttypes.h>
-#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 #include <json-c/json.h>
-#include <libubox/blobmsg.h>
-#include <libubox/blobmsg_json.h>
-#include <libubus.h>
 
-#include "network.h"
-#include "openwrt.h"
-#include "sr_uci.h"
-#include "ubus.h"
-#include "version.h"
+#include <sysrepo.h>
+#include <sysrepo/xpath.h>
 
-const char *YANG_MODEL = "ietf-interfaces";
+#include <srpo_uci.h>
+#include <srpo_ubus.h>
 
-/* Configuration part of the plugin. */
-typedef struct sr_uci_mapping {
-  char ucipath[MAX_UCI_PATH];
-  char xpath[MAX_XPATH];
-} sr_uci_link;
+#include "transform_data.h"
+#include "utils/memory.h"
 
-/* Mappings of uci options to Sysrepo xpaths. */
-static sr_uci_link table_sr_uci[] = {
-    {"network.%s.ipaddr", "/ietf-interfaces:interfaces/interface[name='%s']/"
-                          "ietf-ip:ipv4/address[ip='%s']/ip"},
-    {"network.%s.ip6addr", "/ietf-interfaces:interfaces/interface[name='%s']/"
-                           "ietf-ip:ipv6/address[ip='%s']/ip"},
-    {"network.%s.mtu",
-     "/ietf-interfaces:interfaces/interface[name='%s']/ietf-ip:ipv4/mtu"},
-    {"network.%s.mtu",
-     "/ietf-interfaces:interfaces/interface[name='%s']/ietf-ip:ipv6/mtu"},
-    {"network.%s.enabled",
-     "/ietf-interfaces:interfaces/interface[name='%s']/ietf-ip:ipv4/enabled"},
-    {"network.%s.enabled",
-     "/ietf-interfaces:interfaces/interface[name='%s']/ietf-ip:ipv6/enabled"},
-    {"network.%s.ip4prefixlen",
-     "/ietf-interfaces:interfaces/interface[name='%s']/ietf-ip:ipv4/"
-     "address[ip='%s']/prefix-length"},
-    {"network.%s.ip6prefixlen",
-     "/ietf-interfaces:interfaces/interface[name='%s']/ietf-ip:ipv6/"
-     "address[ip='%s']/prefix-length"},
-    {"network.%s.netmask", "/ietf-interfaces:interfaces/interface[name='%s']/"
-                           "ietf-ip:ipv4/address[ip='%s']/netmask"},
+#define ARRAY_SIZE(X) (sizeof((X)) / sizeof((X)[0]))
+
+#define NETWORK_YANG_MODEL "ietf-interfaces"
+#define SYSREPOCFG_EMPTY_CHECK_COMMAND "sysrepocfg -X -d running -m " NETWORK_YANG_MODEL
+#define NETWORK_INTERFACE_XPATH_TEMPLATE "/" NETWORK_YANG_MODEL ":interfaces/interface[name='%s']"
+#define NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/" NETWORK_YANG_MODEL ":interfaces-state"
+
+typedef char *(*transform_data_cb)(const char *);
+
+typedef struct {
+	const char *value_name;
+	const char *xpath_template;
+	transform_data_cb transform_data;
+} network_ubus_json_transform_table_t;
+
+int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data);
+void network_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data);
+
+static int network_module_change_cb(sr_session_ctx_t *session, const char *module_name, const char *xpath, sr_event_t event, uint32_t request_id, void *private_data);
+static int network_state_data_cb(sr_session_ctx_t *session, const char *module_name, const char *path, const char *request_xpath, uint32_t request_id, struct lyd_node **parent, void *private_data);
+
+static bool network_running_datastore_is_empty_check(void);
+static int network_uci_data_load(sr_session_ctx_t *session);
+static char *network_xpath_get(const struct lyd_node *node);
+
+static void network_ubus(const char *ubus_json, srpo_ubus_result_values_t *values);
+static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath, srpo_ubus_result_values_t *values, struct lyd_node **parent);
+
+srpo_uci_xpath_uci_template_map_t network_xpath_uci_path_template_map[] = {
+	{NETWORK_INTERFACE_XPATH_TEMPLATE "network.%s", "interface", NULL, NULL, false, false},
+	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/mtu", "network.%s.mtu", NULL, NULL,  NULL, false, false},
+	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/mtu", "network.%s.mtu", NULL, NULL, NULL, false, false},
+	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/enabled", "network.%s.enabled", NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
+	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/enabled", "network.%s.enabled",  NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
 };
 
-/* Update UCI configuration from Sysrepo datastore. */
-static int config_store_to_uci(sr_ctx_t *ctx, sr_val_t *value);
-
-/* get UCI boolean value */
-static bool parse_uci_bool(char *value) {
-
-  if (0 == strncmp("1", value, strlen(value))) {
-    return true;
-  } else if (0 == strncmp("yes", value, strlen(value))) {
-    return true;
-  } else if (0 == strncmp("on", value, strlen(value))) {
-    return true;
-  } else if (0 == strncmp("true", value, strlen(value))) {
-    return true;
-  } else if (0 == strncmp("enabled", value, strlen(value))) {
-    return true;
-  } else {
-    return true;
-  }
+srpo_uci_xpath_uci_template_map_t network_xpath_uci_path_unnamed_template_map[] = {
+	{"/ietf-ip:ipv4/address[ip='%s']/ip", "network.%s.ipaddr", NULL, NULL, NULL, false, false},
+	{"/ietf-ip:ipv6/address[ip='%s']/ip", "network.%s.ip6addr", NULL, NULL, NULL, false, false},
+	{"/ietf-ip:ipv4/address[ip='%s']/prefix-length", "network.%s.ip4prefixlen", NULL, NULL, NULL, false, false},
+	{"/ietf-ip:ipv6/address[ip='%s']/prefix-length", "network.%s.ip6prefixlen", NULL, NULL, NULL, false, false},
+	{"/ietf-ip:ipv4/address[ip='%s']/netmask", "network.%s.netmask", NULL, NULL, NULL, false, false},
 };
 
-static bool val_has_data(sr_type_t type) {
-  /* types containing some data */
-  switch (type) {
-  case SR_BINARY_T:
-  case SR_BITS_T:
-  case SR_BOOL_T:
-  case SR_DECIMAL64_T:
-  case SR_ENUM_T:
-  case SR_IDENTITYREF_T:
-  case SR_INSTANCEID_T:
-  case SR_INT8_T:
-  case SR_INT16_T:
-  case SR_INT32_T:
-  case SR_INT64_T:
-  case SR_STRING_T:
-  case SR_UINT8_T:
-  case SR_UINT16_T:
-  case SR_UINT32_T:
-  case SR_UINT64_T:
-  case SR_ANYXML_T:
-  case SR_ANYDATA_T:
-    return true;
-  default:
-    return false;
-  }
+
+static network_ubus_json_transform_table_t network_transform_table[] = {
+	{.value_name = "type", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/type"},
+	{.value_name = "admin-status", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/admin-status"},
+	{.value_name = "oper-status", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/oper_status"},
+	{.value_name = "last-change", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/last-change"},
+	{.value_name = "if-index", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/if-index"},
+	{.value_name = "phys-address", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/phys-address"},
+	{.value_name = "speed", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/speed"},
+};
+
+static const char *network_uci_sections[] = {"interface"};
+static const char *network_uci_unnamed_sections[] = {"interface"};
+static const char *network_ubus_object_paths[] = {"network.device", "network.interface", "network.interface", "sfp.ddm", "router.net", "router.net"};
+static const char *network_ubus_object_methods[] = {"status", "status", "dump", "get-all", "arp", "ipv6-neigh"};
+
+static struct {
+	const char *uci_file;
+	const char **uci_section_list;
+	size_t uci_section_list_size;
+	bool convert_unnamed_sections;
+} network_config_files[] = {
+	{"network", network_uci_sections, ARRAY_SIZE(network_uci_sections), true},
+	{"network", network_uci_unnamed_sections, ARRAY_SIZE(network_uci_unnamed_sections), false},
+};
+
+int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
+{
+	int error = 0;
+	sr_conn_ctx_t *connection = NULL;
+	sr_session_ctx_t *startup_session = NULL;
+	sr_subscription_ctx_t *subscription = NULL;
+
+	*private_data = NULL;
+
+	error = srpo_uci_init();
+	if (error) {
+		SRP_LOG_ERR("srpo_uci_init error (%d): %s", error, srpo_uci_error_description_get(error));
+		goto error_out;
+	}
+
+	SRP_LOG_INFMSG("start session to startup datastore");
+
+	connection = sr_session_get_connection(session);
+	error = sr_session_start(connection, SR_DS_STARTUP, &startup_session);
+	if (error) {
+		SRP_LOG_ERR("sr_session_start error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	*private_data = startup_session;
+
+	if (network_running_datastore_is_empty_check() == true) {
+		SRP_LOG_INFMSG("running DS is empty, loading data from UCI");
+
+		error = network_uci_data_load(session);
+		if (error) {
+			SRP_LOG_ERRMSG("network_uci_data_load error");
+			goto error_out;
+		}
+
+		error = sr_copy_config(startup_session, NETWORK_YANG_MODEL, SR_DS_RUNNING, 0, 0);
+		if (error) {
+			SRP_LOG_ERR("sr_copy_config error (%d): %s", error, sr_strerror(error));
+			goto error_out;
+		}
+	}
+
+	SRP_LOG_INFMSG("subscribing to module change");
+	error = sr_module_change_subscribe(session, NETWORK_YANG_MODEL, "/" NETWORK_YANG_MODEL ":*//* ", network_module_change_cb, *private_data, 0, SR_SUBSCR_DEFAULT, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_module_change_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	SRP_LOG_INFMSG("subscribing to get oper items");
+
+	error = sr_oper_get_items_subscribe(session, NETWORK_YANG_MODEL, "/ietf-interfaces:interfaces-state", network_state_data_cb, NULL, SR_SUBSCR_CTX_REUSE, &subscription);
+	if (error) {
+		SRP_LOG_ERR("sr_oper_get_items_subscribe error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	SRP_LOG_INFMSG("plugin init done");
+
+	goto out;
+
+error_out:
+	sr_unsubscribe(subscription);
+	
+out:
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
 }
 
-static void restart_network_over_ubus(int wait_time) {
-  system("/etc/init.d/network reload > /dev/null");
+static bool network_running_datastore_is_empty_check(void)
+{
+	FILE *sysrepocfg_DS_empty_check = NULL;
+	bool is_empty = false;
+
+	sysrepocfg_DS_empty_check = popen(SYSREPOCFG_EMPTY_CHECK_COMMAND, "r");
+	if (sysrepocfg_DS_empty_check == NULL) {
+		SRP_LOG_WRN("could not execute %s", SYSREPOCFG_EMPTY_CHECK_COMMAND);
+		is_empty = true;
+		goto out;
+	}
+	
+	if (fgetc(sysrepocfg_DS_empty_check) == EOF) {
+		is_empty = true;
+	}
+
+out:
+	if (sysrepocfg_DS_empty_check) {
+		pclose(sysrepocfg_DS_empty_check);
+	}
+
+	return is_empty;
 }
 
-static void ubus_cb(struct ubus_request *req, int type, struct blob_attr *msg) {
-  sr_ctx_t *ctx = req->priv;
-  struct json_object *r = NULL;
-  char *json_result = NULL;
+static int network_uci_data_load(sr_session_ctx_t *session)
+{
+	int error = 0;
+	char **uci_path_list = NULL;
+	size_t uci_path_list_size = 0;
+	char *xpath = NULL;
+	srpo_uci_transform_data_cb transform_uci_data_cb = NULL;
+	bool has_transform_uci_data_private = false;
+	char *uci_section_name = NULL;
+	char **uci_value_list = NULL;
+	size_t uci_value_list_size = 0;
+	srpo_uci_xpath_uci_template_map_t *template_map = NULL;
+	size_t template_map_size = 0;
 
-  if (msg) {
-    json_result = blobmsg_format_json(msg, true);
-    r = json_tokener_parse(json_result);
-  } else {
-    goto cleanup;
-  }
-  priv_t *p_data = (priv_t *)ctx->data;
-  p_data->tmp = r;
+	for (size_t i = 0; i < ARRAY_SIZE(network_config_files); i++) {
+
+		if (network_config_files[i].convert_unnamed_sections) {
+			template_map = network_xpath_uci_path_template_map;
+			template_map_size = ARRAY_SIZE(network_xpath_uci_path_template_map);
+		} else {
+			template_map = network_xpath_uci_path_unnamed_template_map;
+			template_map_size = ARRAY_SIZE(network_xpath_uci_path_unnamed_template_map);
+		}
+
+		error = srpo_uci_ucipath_list_get(network_config_files[i].uci_file, network_config_files[i].uci_section_list, network_config_files[i].uci_section_list_size, &uci_path_list, &uci_path_list_size, network_config_files[i].convert_unnamed_sections);
+		if (error) {
+			SRP_LOG_ERR("srpo_uci_path_list_get error (%d): %s", error, srpo_uci_error_description_get(error));
+			goto error_out;
+		}
+
+		for (size_t j = 0; j < uci_path_list_size; j++) {
+			if (network_config_files[i].convert_unnamed_sections) {
+				error = srpo_uci_ucipath_to_xpath_convert(uci_path_list[j], template_map, template_map_size, &xpath);
+			} else {
+				error = srpo_uci_sublist_ucipath_to_xpath_convert(uci_path_list[j], NETWORK_INTERFACE_XPATH_TEMPLATE, "network.%s", template_map, template_map_size, &xpath);
+				error = NULL;
+			}
+
+			if (error && error != SRPO_UCI_ERR_NOT_FOUND) {
+				SRP_LOG_ERR("srpo_uci_to_xpath_path_convert error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			} else if (error == SRPO_UCI_ERR_NOT_FOUND) {
+				FREE_SAFE(uci_path_list[j]);
+				continue;
+			}
+
+			error = srpo_uci_transform_uci_data_cb_get(uci_path_list[j], template_map, template_map_size,
+								   &transform_uci_data_cb);
+			if (error) {
+				SRP_LOG_ERR("srpo_uci_transfor_uci_data_cb_get error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			}
+
+			error = srpo_uci_has_transform_uci_data_private_get(uci_path_list[j], template_map, template_map_size, &has_transform_uci_data_private);
+			if (error) {
+				SRP_LOG_ERR("srpo_uci_has_transform_uci_data_private_get error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			}
+
+			uci_section_name = srpo_uci_section_name_get(uci_path_list[j]);
+
+			error = srpo_uci_element_value_get(uci_path_list[j], transform_uci_data_cb, has_transform_uci_data_private ? uci_section_name : NULL, &uci_value_list, &uci_value_list_size);
+			if (error) {
+				SRP_LOG_ERR("srpo_uci_element_value_get error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			}
+
+			for (size_t k = 0; k < uci_value_list_size; k++) {
+				error = sr_set_item_str(session, xpath, uci_value_list[k], NULL, SR_EDIT_DEFAULT);
+				if (error) {
+					SRP_LOG_ERR("sr_set_item_str error (%d): %s", error, sr_strerror(error));
+					goto error_out;
+				}
+
+				FREE_SAFE(uci_value_list[k]);
+			}
+
+			FREE_SAFE(uci_section_name);
+			FREE_SAFE(uci_path_list[j]);
+			FREE_SAFE(xpath);
+		}
+
+		/*
+		 * FIXME: libuci otherwise checks the context for existing file
+		 * in `uci_switch_config` and throws `UCI_ERR_DUPLICATE`.
+		 */
+		srpo_uci_cleanup();
+		error = srpo_uci_init();
+		if (error) {
+			SRP_LOG_ERR("srpo_uci_init error (%d): %s", error, srpo_uci_error_description_get(error));
+			goto error_out;
+		}
+	}
+
+	error = sr_apply_changes(session, 0, 0);
+	if (error) {
+		SRP_LOG_ERR("sr_apply_changes error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+	}
+
+	goto out;
+
+error_out:
+	FREE_SAFE(xpath);
+	FREE_SAFE(uci_section_name);
+
+	for (size_t i = 0; i < uci_path_list_size; i++) {
+		FREE_SAFE(uci_path_list[i]);
+	}
+
+	FREE_SAFE(uci_path_list);
+
+	for (size_t i = 0; i < uci_value_list_size; i++) {
+		FREE_SAFE(uci_value_list[i]);
+	}
+
+	FREE_SAFE(uci_value_list);
+
+out:
+	return error ? -1 : 0;
+}
+
+void network_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data)
+{
+	srpo_uci_cleanup();
+
+	sr_session_ctx_t *startup_session = (sr_session_ctx_t *) private_data;
+
+	if (startup_session) {
+		sr_session_stop(startup_session);
+	}
+
+	SRP_LOG_INFMSG("plugin cleanup finished");
+}
+
+static int network_module_change_cb(sr_session_ctx_t *session, const char *module_name, const char *xpath, sr_event_t event, uint32_t request_id, void *private_data)
+{
+	int error = 0;
+	sr_session_ctx_t *startup_session = (sr_session_ctx_t *) private_data;
+	sr_change_iter_t *network_server_change_iter = NULL;
+	sr_change_oper_t operation = SR_OP_CREATED;
+	const struct lyd_node *node = NULL;
+	const char *prev_value = NULL;
+	const char *prev_list = NULL;
+	bool prev_default = false;
+	char *node_xpath = NULL;
+	const char *node_value = NULL;
+	char *uci_path = NULL;
+	struct lyd_node_leaf_list *node_leaf_list;
+	struct lys_node_leaf *schema_node_leaf;
+	srpo_uci_transform_data_cb transform_sysrepo_data_cb = NULL;
+	bool has_transform_sysrepo_data_private = false;
+	const char *uci_section_type = NULL;
+	char *uci_section_name = NULL;
+	void *transform_cb_data = NULL;
+
+	SRP_LOG_INF("module_name: %s, xpath: %s, event: %d, request_id: %" PRIu32, module_name, xpath, event, request_id);
+
+	if (event == SR_EV_ABORT) {
+		SRP_LOG_ERR("aborting changes for: %s", xpath);
+		error = -1;
+		goto error_out;
+	}
+
+	if (event == SR_EV_DONE) {
+		error = sr_copy_config(startup_session, NETWORK_YANG_MODEL, SR_DS_RUNNING, 0, 0);
+		if (error) {
+			SRP_LOG_ERR("sr_copy_config error (%d): %s", error, sr_strerror(error));
+			goto error_out;
+		}
+	}
+
+	if (event == SR_EV_CHANGE) {
+		error = sr_get_changes_iter(session, xpath, &network_server_change_iter);
+		if (error) {
+		SRP_LOG_ERR("sr_get_changes_iter error (%d): %s", error, sr_strerror(error));
+		goto error_out;
+		}
+
+		while (sr_get_change_tree_next(session, network_server_change_iter, &operation, &node, &prev_value, &prev_list, &prev_default) == SR_ERR_OK) {
+			node_xpath = network_xpath_get(node);
+			error = srpo_uci_xpath_to_ucipath_convert(node_xpath, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &uci_path);
+			if (error && error != SRPO_UCI_ERR_NOT_FOUND) {
+			SRP_LOG_ERR("srpo_uci_xpath_to_ucipath_convert error (%d): %s", error, srpo_uci_error_description_get(error));
+			goto error_out;
+			}  else if (error == SRPO_UCI_ERR_NOT_FOUND) {
+				error = 0;
+				SRP_LOG_DBG("xpath %s not found in table", node_xpath);
+				FREE_SAFE(node_xpath);
+				continue;
+			}
+
+			error = srpo_uci_transform_sysrepo_data_cb_get(node_xpath, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &transform_sysrepo_data_cb);
+			if (error) {
+				SRP_LOG_ERR("srpo_uci_transfor_sysrepo_data_cb_get error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			}
+
+			error = srpo_uci_has_transform_sysrepo_data_private_get(node_xpath, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &has_transform_sysrepo_data_private);
+			if (error) {
+				SRP_LOG_ERR("srpo_uci_has_transform_sysrepo_data_private_get error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			}
+
+			error = srpo_uci_section_type_get(uci_path, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &uci_section_type);
+			if (error) {
+				SRP_LOG_ERR("srpo_uci_section_type_get error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			}
+
+			uci_section_name = srpo_uci_section_name_get(uci_path);
+
+			if (node->schema->nodetype == LYS_LEAF || node->schema->nodetype == LYS_LEAFLIST) {
+				node_leaf_list = (struct lyd_node_leaf_list *) node;
+				node_value = node_leaf_list->value_str;
+				if (node_value == NULL) {
+					schema_node_leaf = (struct lys_node_leaf *) node_leaf_list->schema;
+					node_value = schema_node_leaf->dflt ? schema_node_leaf->dflt : "";
+				}
+			}
+
+			SRP_LOG_DBG("uci_path: %s; prev_val: %s; node_val: %s; operation: %d", uci_path, prev_value, node_value, operation);
+
+			if (node->schema->nodetype == LYS_LIST) {
+				if (operation == SR_OP_CREATED) {
+					error = srpo_uci_section_create(uci_path, uci_section_type);
+					if (error) {
+						SRP_LOG_ERR("srpo_uci_section_create error (%d): %s", error, srpo_uci_error_description_get(error));
+						goto error_out;
+					}
+				} else if (operation == SR_OP_DELETED) {
+					error = srpo_uci_section_delete(uci_path);
+					if (error) {
+						SRP_LOG_ERR("srpo_uci_section_delete error (%d): %s", error, srpo_uci_error_description_get(error));
+						goto error_out;
+					}
+				}
+			} else if (node->schema->nodetype == LYS_LEAF) {
+				if (operation == SR_OP_CREATED || operation == SR_OP_MODIFIED) {
+					if (has_transform_sysrepo_data_private && strstr(node_xpath, "stop")) {
+						transform_cb_data = (void *) &(leasetime_data_t){.uci_section_name = uci_section_name, .sr_session = session};
+
+					} else if (has_transform_sysrepo_data_private) {
+						transform_cb_data = uci_section_name;
+					} else {
+						transform_cb_data = NULL;
+					}
+
+					error = srpo_uci_option_set(uci_path, node_value, transform_sysrepo_data_cb, transform_cb_data);
+					if (error) {
+						SRP_LOG_ERR("srpo_uci_option_set error (%d): %s", error, srpo_uci_error_description_get(error));
+						goto error_out;
+					}
+				} else if (operation == SR_OP_DELETED) {
+					error = srpo_uci_option_remove(uci_path);
+					if (error) {
+						SRP_LOG_ERR("srpo_uci_option_remove error (%d): %s", error, srpo_uci_error_description_get(error));
+						goto error_out;
+					}
+				}
+			} else if (node->schema->nodetype == LYS_LEAFLIST) {
+				if (has_transform_sysrepo_data_private) {
+					transform_cb_data = uci_section_name;
+				} else {
+					transform_cb_data = NULL;
+				}
+
+				if (operation == SR_OP_CREATED) {
+					error = srpo_uci_list_set(uci_path, node_value, transform_sysrepo_data_cb, transform_cb_data);
+					if (error) {
+						SRP_LOG_ERR("srpo_uci_list_set error (%d): %s", error, srpo_uci_error_description_get(error));
+						goto error_out;
+					}
+				} else if (operation == SR_OP_DELETED) {
+					error = srpo_uci_list_remove(uci_path, node_value);
+					if (error) {
+						SRP_LOG_ERR("srpo_uci_list_remove error (%d): %s", error, srpo_uci_error_description_get(error));
+						goto error_out;
+					}
+				}
+			}
+			FREE_SAFE(uci_section_name);
+			FREE_SAFE(uci_path);
+			FREE_SAFE(node_xpath);
+			node_value = NULL;
+		}
+
+		srpo_uci_commit("network");
+	}
+
+	goto out;
+
+error_out:
+	srpo_uci_revert("network");
+
+out:
+	FREE_SAFE(uci_section_name);
+	FREE_SAFE(node_xpath);
+	FREE_SAFE(uci_path);
+	sr_free_change_iter(network_server_change_iter);
+
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
+}
+
+static char *network_xpath_get(const struct lyd_node *node)
+{
+	char *xpath_node = NULL;
+	char *xpath_leaflist_open_bracket = NULL;
+	size_t xpath_trimed_size = 0;
+	char *xpath_trimed = NULL;
+
+	if (node->schema->nodetype == LYS_LEAFLIST) {
+		xpath_node = lyd_path(node);
+		xpath_leaflist_open_bracket = strrchr(xpath_node, '[');
+		if (xpath_leaflist_open_bracket == NULL) {
+			return xpath_node;
+		}
+
+		xpath_trimed_size = (size_t) xpath_leaflist_open_bracket - (size_t) xpath_node + 1;
+		xpath_trimed = xcalloc(1, xpath_trimed_size);
+		strncpy(xpath_trimed, xpath_node, xpath_trimed_size - 1);
+		xpath_trimed[xpath_trimed_size - 1] = '\0';
+
+		FREE_SAFE(xpath_node);
+
+		return xpath_trimed;
+	} else {
+		return lyd_path(node);
+	}
+}
+
+static int network_state_data_cb(sr_session_ctx_t *session, const char *module_name, const char *path, const char *request_xpath, uint32_t request_id, struct lyd_node **parent, void *private_data)
+{
+	srpo_ubus_result_values_t *values = NULL;
+	srpo_ubus_call_data_t ubus_call_data = {.lookup_path = NULL, .method = NULL, .transform_data_cb = network_ubus, .timeout = 0, .json_call_arguments = NULL};
+	int error = SRPO_UBUS_ERR_OK;
+
+	if (!strcmp(path, NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE) || !strcmp(path, "*")) {
+		srpo_ubus_init_result_values(&values);
+
+		for (size_t i = 0; i < ARRAY_SIZE(network_ubus_object_methods); i++) {
+			ubus_call_data.lookup_path = network_ubus_object_methods[i];
+			ubus_call_data.method = network_ubus_object_paths[i];
+
+			error = srpo_ubus_call(values, &ubus_call_data);
+			if (error != SRPO_UBUS_ERR_OK) {
+				SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
+				goto out;
+			}
+		}
+/*
+		ubus_call_data.lookup_path = "router.net";
+		ubus_call_data.method = "arp";
+		error = srpo_ubus_call(values, &ubus_call_data);
+		if (error != SRPO_UBUS_ERR_OK) {
+			FILE *arptable = NULL;
+			char line[512];
+			json_object *;
+
+			arptable = fopen("/proc/net/arp", "r");
+			json_arptable = json_object_from_file(arptable);
+
+			while (fgets(line, sizeof(line), arptable) != NULL) {
+				json_object_string
+			}
+			fclose(arptable);
+
+			SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
+		}
+
+		ubus_call_data.method = "ipv6-neigh";
+		error = srpo_ubus_call(values, &ubus_call_data);
+		if (error != SRPO_UBUS_ERR_OK) {
+			//TODO openwrt_ipv6_neigh
+			SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
+			goto out;
+		}
+*/
+		error = store_ubus_values_to_datastore(session, request_xpath, values, parent);
+		if (error) {
+			SRP_LOG_ERR("store_ubus_values_to_datastore error (%d)", error);
+			goto out;
+		}
+		srpo_ubus_free_result_values(values);
+		values = NULL;
+		}
+
+out:
+	if (values) {
+		srpo_ubus_free_result_values(values);
+	}
+
+	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
+}
+
+static void network_ubus(const char *ubus_json, srpo_ubus_result_values_t *values)
+{
+	json_object *result = NULL;
+	json_object *child_value = NULL;
+	const char *value_string = NULL;
+	srpo_ubus_error_e error = SRPO_UBUS_ERR_OK;
+
+	result = json_tokener_parse(ubus_json);
+
+	json_object_object_foreach(result, key, value)
+	{
+		for (size_t i = 0; i < ARRAY_SIZE(network_transform_table); i++) {
+			json_object_object_get_ex(value, network_transform_table[i].value_name, &child_value);
+			if (child_value == NULL) {
+				goto cleanup;
+			}
+
+			value_string = json_object_get_string(child_value);
+
+			error = srpo_ubus_result_values_add(values, value_string, strlen(value_string),network_transform_table[i].xpath_template,strlen(network_transform_table[i].xpath_template),key, strlen(key));
+			if (error != SRPO_UBUS_ERR_OK) {
+				goto cleanup;
+			}
+		}
+	}
 
 cleanup:
-  if (NULL != json_result) {
-    free(json_result);
-  }
-  return;
+	json_object_put(result);
+	return ;
 }
 
-static void clear_ubus_data(sr_ctx_t *ctx) {
-  priv_t *p_data = (priv_t *)ctx->data;
-  /* clear data out if it exists */
-  if (p_data->i) {
-    json_object_put(p_data->i);
-    p_data->i = NULL;
-  }
-  if (p_data->d) {
-    json_object_put(p_data->d);
-    p_data->d = NULL;
-  }
-  if (p_data->a) {
-    json_object_put(p_data->a);
-    p_data->a = NULL;
-  }
-  if (p_data->n) {
-    json_object_put(p_data->n);
-    p_data->n = NULL;
-  }
-  if (p_data->ll) {
-    json_object_put(p_data->ll);
-    p_data->ll = NULL;
-  }
-}
-
-static int get_oper_interfaces(sr_ctx_t *ctx) {
-  int rc = SR_ERR_OK;
-  uint32_t id = 0;
-  struct blob_buf buf = {0};
-  int u_rc = UBUS_STATUS_OK;
-  priv_t *p_data = (priv_t *)ctx->data;
-
-  clear_ubus_data(ctx);
-
-  struct ubus_context *u_ctx = ubus_connect(NULL);
-  if (u_ctx == NULL) {
-    ERR_MSG("Could not connect to ubus");
-    rc = SR_ERR_INTERNAL;
-    goto cleanup;
-  }
-
-  blob_buf_init(&buf, 0);
-  u_rc = ubus_lookup_id(u_ctx, "network.device", &id);
-  UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no object %s", u_rc,
-                 "network.device");
-  u_rc = ubus_invoke(u_ctx, id, "status", buf.head, ubus_cb, ctx, 0);
-  UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no method %s", u_rc, "status");
-  p_data->d = p_data->tmp;
-  blob_buf_free(&buf);
-
-  blob_buf_init(&buf, 0);
-  u_rc = ubus_lookup_id(u_ctx, "network.interface", &id);
-  UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no object %s", u_rc,
-                 "network.interface");
-  u_rc = ubus_invoke(u_ctx, id, "dump", buf.head, ubus_cb, ctx, 0);
-  UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no method %s", u_rc, "dump");
-  p_data->i = p_data->tmp;
-  blob_buf_free(&buf);
-
-  blob_buf_init(&buf, 0);
-  u_rc = ubus_lookup_id(u_ctx, "router.net", &id);
-  if (UBUS_STATUS_NOT_FOUND == u_rc) {
-    INF_MSG("using generic functions");
-    rc = openwrt_rap(&p_data->a);
-    CHECK_RET_MSG(rc, cleanup, "failed openwrt_arp()");
-  } else {
-    UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no object %s", u_rc,
-                   "router.net");
-    u_rc = ubus_invoke(u_ctx, id, "arp", buf.head, ubus_cb, ctx, 0);
-    UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no method %s", u_rc, "arp");
-    p_data->a = p_data->tmp;
-    blob_buf_free(&buf);
-  }
-
-  blob_buf_init(&buf, 0);
-  u_rc = ubus_lookup_id(u_ctx, "router.net", &id);
-  if (UBUS_STATUS_NOT_FOUND == u_rc) {
-    INF_MSG("using generic functions");
-    rc = openwrt_ipv6_neigh(&p_data->n);
-    CHECK_RET_MSG(rc, cleanup, "failed openwrt_ipv6_neigh()");
-  } else {
-    UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no object %s", u_rc,
-                   "router.net");
-    u_rc = ubus_invoke(u_ctx, id, "ipv6_neigh", buf.head, ubus_cb, ctx, 0);
-    UBUS_CHECK_RET(u_rc, &rc, cleanup, "ubus [%d]: no method %s", u_rc,
-                   "ipv6_neigh");
-    p_data->n = p_data->tmp;
-    blob_buf_free(&buf);
-  }
-
-  rc = openwrt_ipv6_link_local_address(&p_data->ll);
-  CHECK_RET_MSG(rc, cleanup, "failed openwrt_ipv6_link_local_address()");
-
-cleanup:
-  if (NULL != u_ctx) {
-    ubus_free(u_ctx);
-    blob_buf_free(&buf);
-  }
-  return rc;
-}
-
-static int config_xpath_to_ucipath(sr_ctx_t *ctx, sr_uci_link *mapping,
-                                   sr_val_t *value) {
-  char *val_str = NULL;
-  char ucipath[MAX_UCI_PATH];
-  char xpath[MAX_XPATH];
-  int uci_rc, rc = SR_ERR_OK;
-  char *device_name = get_n_key_value(value->xpath, 0);
-  char *ip = get_n_key_value(value->xpath, 1);
-
-  if (!device_name)
-    goto exit;
-
-  sprintf(xpath, mapping->xpath, device_name, ip);
-
-  val_str = sr_val_to_str(value);
-  if (!val_str) {
-    ERR("val_to_str %s", sr_strerror(rc));
-    rc = SR_ERR_INTERNAL;
-    goto exit;
-  }
-
-  if (0 != strncmp(value->xpath, xpath, strlen(xpath))) {
-    goto exit;
-  }
-  INF("SET %s -> %s", xpath, val_str);
-
-  sprintf(ucipath, mapping->ucipath, device_name);
-  uci_rc = set_uci_item(ctx->uctx, ucipath, val_str);
-  UCI_CHECK_RET(uci_rc, &rc, exit, "get_uci_item %d %s", uci_rc, ucipath);
-
-exit:
-  if (val_str)
-    free(val_str);
-  if (device_name)
-    free(device_name);
-  if (ip)
-    free(ip);
-
-  return rc;
-}
-
-static int config_store_to_uci(sr_ctx_t *ctx, sr_val_t *value) {
-  const int n_mappings = ARR_SIZE(table_sr_uci);
-  int rc = SR_ERR_OK;
-
-  if (false == val_has_data(value->type)) {
-    return SR_ERR_OK;
-  }
-
-  for (int i = 0; i < n_mappings; i++) {
-    if (0 == strcmp(sr_xpath_node_name(value->xpath),
-                    sr_xpath_node_name(table_sr_uci[i].xpath))) {
-      rc = config_xpath_to_ucipath(ctx, &table_sr_uci[i], value);
-      CHECK_RET(rc, error, "Failed to map xpath to ucipath: %s",
-                sr_strerror(rc));
-    }
-  }
-
-error:
-  return rc;
-}
-
-static char *new_path_keys(char *path, char *key1, char *key2, char *key3,
-                           char *key4) {
-  int rc = SR_ERR_OK;
-  char *value = NULL;
-  int len = 0;
-
-  CHECK_NULL_MSG(path, &rc, cleanup, "missing parameter path");
-  CHECK_NULL_MSG(key1, &rc, cleanup, "missing parameter key1");
-  CHECK_NULL_MSG(key2, &rc, cleanup, "missing parameter key2");
-  CHECK_NULL_MSG(key3, &rc, cleanup, "missing parameter key3");
-
-  len = strlen(path) + strlen(key1) + strlen(key2) + strlen(key3);
-  if (key4)
-    len += strlen(key4);
-
-  value = malloc(sizeof(char) * len);
-  CHECK_NULL_MSG(value, &rc, cleanup, "failed malloc");
-
-  if (key4) {
-    snprintf(value, len, path, key1, key2, key3, key4);
-  } else {
-    snprintf(value, len, path, key1, key2, key3);
-  }
-
-  return value;
-cleanup:
-  return strdup("");
-}
-
-static int parse_network_config(sr_ctx_t *ctx) {
-  struct uci_package *package = NULL;
-  char ucipath[MAX_UCI_PATH] = {0};
-  struct uci_element *e;
-  struct uci_section *s;
-  char *xpath = NULL;
-  char *ipaddr = NULL;
-  char *value = NULL;
-  int rc, uci_rc;
-
-  uci_rc = uci_load(ctx->uctx, "network", &package);
-  UCI_CHECK_RET(uci_rc, &rc, error, "uci_load %d %s", uci_rc, "network");
-
-  uci_foreach_element(&package->sections, e) {
-    s = uci_to_section(e);
-    char *type = s->type;
-    char *name = s->e.name;
-    char *fmt =
-        "/ietf-interfaces:interfaces/interface[name='%s']/ietf-ip:ipv%s/%s";
-    char *fmt_ip = "/ietf-interfaces:interfaces/interface[name='%s']/"
-                   "ietf-ip:ipv%s/address[ip='%s']/%s";
-
-    if (0 != strcmp("interface", type)) {
-      continue;
-    }
-
-    /* parse the interface, check IP type
-     * IPv4 -> static, dhcp; IPv6 -> dhcpv6 */
-    bool dhcpv6 = false;
-    bool dhcp = false;
-
-    INF("processing interface %s", name);
-    snprintf(ucipath, MAX_UCI_PATH, "network.%s.proto", name);
-    uci_rc = get_uci_item(ctx->uctx, ucipath, &value);
-    UCI_CHECK_RET(uci_rc, &rc, error, "get_uci_item %d %s", uci_rc, ucipath);
-    if (0 == strncmp("dhcpv6", value, strlen(value))) {
-      dhcpv6 = true;
-    }
-    if (0 == strncmp("dhcp", value, strlen("dhcp"))) {
-      dhcp = true;
-    }
-    char *interface = dhcpv6 ? "6" : "4";
-    free(value);
-
-    snprintf(ucipath, MAX_UCI_PATH, "network.%s.mtu", name);
-    uci_rc = get_uci_item(ctx->uctx, ucipath, &value);
-    if (uci_rc != UCI_OK) {
-      value = strdup("1500");
-    }
-    xpath = new_path_keys(fmt, name, interface, "mtu", NULL);
-    rc =
-        sr_set_item_str(ctx->startup_sess, xpath, value, NULL, SR_EDIT_DEFAULT);
-    del_path_key(&xpath);
-    free(value);
-
-    snprintf(ucipath, MAX_UCI_PATH, "network.%s.enabled", name);
-    rc = get_uci_item(ctx->uctx, ucipath, &value);
-    if (rc != UCI_OK)
-      value = strdup("true");
-    parse_uci_bool(value) ? strcpy(value, "true") : strcpy(value, "false");
-    xpath = new_path_keys(fmt, name, interface, "enabled", NULL);
-    rc =
-        sr_set_item_str(ctx->startup_sess, xpath, value, NULL, SR_EDIT_DEFAULT);
-    del_path_key(&xpath);
-    free(value);
-
-    xpath = new_path_key(
-        "/ietf-interfaces:interfaces/interface[name='%s']/type", name);
-    rc = sr_set_item_str(ctx->startup_sess, xpath,
-                         "iana-if-type:ethernetCsmacd", NULL, SR_EDIT_DEFAULT);
-    CHECK_RET(rc, error, "Couldn't add type for interface %s: %s", xpath,
-              sr_strerror(rc));
-    del_path_key(&xpath);
-
-    if (dhcp) {
-      continue;
-    }
-    snprintf(ucipath, MAX_UCI_PATH, "network.%s.ipaddr", name);
-    uci_rc = get_uci_item(ctx->uctx, ucipath, &ipaddr);
-    UCI_CHECK_RET(uci_rc, &rc, error, "get_uci_item %d %s", uci_rc, ucipath);
-
-    /* check if netmask exists, if not use prefix-length */
-    snprintf(ucipath, MAX_UCI_PATH, "network.%s.netmask", name);
-    rc = get_uci_item(ctx->uctx, ucipath, &value);
-    if (rc == UCI_OK) {
-      xpath = new_path_keys(fmt_ip, name, interface, ipaddr, "netmask");
-      rc = sr_set_item_str(ctx->startup_sess, xpath, value, NULL,
-                           SR_EDIT_DEFAULT);
-      del_path_key(&xpath);
-      free(value);
-    } else {
-      snprintf(ucipath, MAX_UCI_PATH, "network.%s.ip%sprefixlen", interface,
-               name);
-      rc = get_uci_item(ctx->uctx, ucipath, &value);
-      // UCI default values for ip4prefixlen and ip6prefixlen
-      if (rc != UCI_OK)
-        value = dhcpv6 ? strdup("64") : strdup("24");
-
-      xpath = new_path_keys(fmt_ip, name, interface, ipaddr, "prefix-length");
-      rc = sr_set_item_str(ctx->startup_sess, xpath, value, NULL,
-                           SR_EDIT_DEFAULT);
-      del_path_key(&xpath);
-      free(value);
-    }
-    free(ipaddr);
-  }
-
-  INF_MSG("commit the sysrepo changes");
-  rc = sr_apply_changes(ctx->startup_sess, 0, 0);
-  CHECK_RET(rc, error, "Couldn't apply changes initial interfaces: %s",
-            sr_strerror(rc));
-
-error:
-  if (package)
-    uci_unload(ctx->uctx, package);
-  return rc;
-}
-
-static int parse_change(sr_session_ctx_t *session, sr_ctx_t *ctx,
-                        const char *module_name, sr_event_t event) {
-  int rc = SR_ERR_OK;
-  sr_change_oper_t oper;
-  sr_change_iter_t *it = NULL;
-  sr_val_t *old_value = NULL;
-  sr_val_t *new_value = NULL;
-  char xpath[256] = {
-      0,
-  };
-
-  snprintf(xpath, 256, "/%s:*//.", module_name);
-
-  rc = sr_get_changes_iter(session, xpath, &it);
-  if (SR_ERR_OK != rc) {
-    printf("Get changes iter failed for xpath %s", xpath);
-    goto error;
-  }
-
-  while (SR_ERR_OK ==
-         sr_get_change_next(session, it, &oper, &old_value, &new_value)) {
-    if (SR_OP_CREATED == oper || SR_OP_MODIFIED == oper) {
-      rc = config_store_to_uci(ctx, new_value);
-    }
-    sr_free_val(old_value);
-    sr_free_val(new_value);
-    CHECK_RET(rc, error, "failed to add operation: %s", sr_strerror(rc));
-  }
-
-error:
-  if (NULL != it) {
-    sr_free_change_iter(it);
-  }
-  return rc;
-}
-
-static int module_change_cb(sr_session_ctx_t *session, const char *module_name,
-                            const char *xpath, sr_event_t event,
-                            uint32_t request_id, void *private_ctx) {
-  int rc = SR_ERR_OK;
-  sr_ctx_t *ctx = (sr_ctx_t *)private_ctx;
-  INF("%s configuration has changed.", YANG_MODEL);
-
-  /* copy ietf-sytem running to startup */
-  if (SR_EV_DONE == event) {
-    /* copy running datastore to startup */
-
-    rc = sr_copy_config(ctx->startup_sess, module_name, SR_DS_RUNNING,
-                        SR_DS_STARTUP, 0);
-    if (SR_ERR_OK != rc) {
-      WRN_MSG("Failed to copy running datastore to startup");
-      /* TODO handle this error */
-      return rc;
-    }
-    restart_network_over_ubus(2);
-    return SR_ERR_OK;
-  }
-
-  rc = parse_change(session, ctx, module_name, event);
-  CHECK_RET(rc, error, "failed to apply sysrepo: %s", sr_strerror(rc));
-
-error:
-  return rc;
-}
-
-static size_t list_size(struct list_head *list) {
-  size_t current_size = 0;
-  struct value_node *vn;
-
-  list_for_each_entry(vn, list, head) { current_size += 1; }
-
-  return current_size;
-}
-
-static int sr_dup_val_data(sr_val_t *dest, const sr_val_t *source) {
-  int rc = SR_ERR_OK;
-
-  switch (source->type) {
-  case SR_BINARY_T:
-    rc = sr_val_set_str_data(dest, source->type, source->data.binary_val);
-    break;
-  case SR_BITS_T:
-    rc = sr_val_set_str_data(dest, source->type, source->data.bits_val);
-    break;
-  case SR_ENUM_T:
-    rc = sr_val_set_str_data(dest, source->type, source->data.enum_val);
-    break;
-  case SR_IDENTITYREF_T:
-    rc = sr_val_set_str_data(dest, source->type, source->data.identityref_val);
-    break;
-  case SR_INSTANCEID_T:
-    rc = sr_val_set_str_data(dest, source->type, source->data.instanceid_val);
-    break;
-  case SR_STRING_T:
-    rc = sr_val_set_str_data(dest, source->type, source->data.string_val);
-    break;
-  case SR_BOOL_T:
-  case SR_DECIMAL64_T:
-  case SR_INT8_T:
-  case SR_INT16_T:
-  case SR_INT32_T:
-  case SR_INT64_T:
-  case SR_UINT8_T:
-  case SR_UINT16_T:
-  case SR_UINT32_T:
-  case SR_UINT64_T:
-    dest->data = source->data;
-    dest->type = source->type;
-    break;
-  default:
-    dest->type = source->type;
-    break;
-  }
-
-  sr_val_set_xpath(dest, source->xpath);
-  return rc;
-}
-
-static int data_provider_interface_cb(sr_session_ctx_t *session,
-                                      const char *module_name, const char *path,
-                                      const char *request_xpath,
-                                      uint32_t request_id,
-                                      struct lyd_node **parent,
-                                      void *private_data) {
-  sr_ctx_t *ctx = (sr_ctx_t *)private_data;
-  int rc = SR_ERR_OK;
-  priv_t *p_data = (priv_t *)ctx->data;
-  sr_val_t *values = NULL;
-  size_t values_cnt = 0;
-  char *value_string = NULL;
-  const struct ly_ctx *ly_ctx = NULL;
-
-  if (strlen(path) > strlen("/ietf-interfaces:interfaces-state")) {
-    return SR_ERR_OK;
-  }
-
-  rc = get_oper_interfaces(ctx);
-  CHECK_RET(rc, exit, "Couldn't initialize uci interfaces: %s",
-            sr_strerror(rc));
-  /* copy json objects from ubus call network.device status to ctx->data */
-
-  struct list_head list = LIST_HEAD_INIT(list);
-
-  /* get interface list */
-  struct json_object *r = NULL;
-  json_object_object_get_ex(p_data->i, "interface", &r);
-  if (NULL != r) {
-    int j;
-    const int N = json_object_array_length(r);
-    for (j = 0; j < N; j++) {
-      json_object *item, *n;
-      item = json_object_array_get_idx(r, j);
-      json_object_object_get_ex(item, "interface", &n);
-      if (NULL == n)
-        continue;
-      char *interface = (char *)json_object_get_string(n);
-      rc = operstatus_transform(p_data, interface, &list);
-      INF("operstatus_transform %s", sr_strerror(rc));
-    }
-  }
-  // get list of bridge members and call phy_interfaces_state_cb
-  json_object_object_foreach(p_data->d, key, val) {
-    // suppress unused warning
-    (void)(key);
-    json_object_object_get_ex(val, "bridge-members", &r);
-    if (NULL != r) {
-      int j = 0;
-      const int N = json_object_array_length(r);
-      for (j = 0; j < N; j++) {
-        json_object *item;
-        item = json_object_array_get_idx(r, j);
-        rc = phy_interfaces_state_cb(
-            p_data, (char *)json_object_get_string(item), &list);
-        INF("phy_interfaces_state_cb %s", sr_strerror(rc));
-      }
-    }
-  }
-
-  size_t cnt = 0;
-  cnt = list_size(&list);
-
-  struct value_node *vn, *q;
-  size_t j = 0;
-  rc = sr_new_values(cnt, &values);
-  INF("%s", sr_strerror(rc));
-
-  list_for_each_entry_safe(vn, q, &list, head) {
-    rc = sr_dup_val_data(&values[j], vn->value);
-    CHECK_RET(rc, exit, "Couldn't copy value: %s", sr_strerror(rc));
-    j += 1;
-    sr_free_val(vn->value);
-    list_del(&vn->head);
-    free(vn);
-  }
-
-  values_cnt = cnt;
-
-  list_del(&list);
-
-  if (*parent == NULL) {
-    ly_ctx = sr_get_context(sr_session_get_connection(session));
-    CHECK_NULL_MSG(ly_ctx, &rc, exit,
-                   "sr_get_context error: libyang context is NULL");
-    *parent = lyd_new_path(NULL, ly_ctx, request_xpath, NULL, 0, 0);
-  }
-
-  for (size_t i = 0; i < values_cnt; i++) {
-    value_string = sr_val_to_str(&values[i]);
-    lyd_new_path(*parent, NULL, values[i].xpath, value_string, 0, 0);
-    free(value_string);
-    value_string = NULL;
-  }
-
-exit:
-  clear_ubus_data(ctx);
-  if (values) {
-    sr_free_values(values, values_cnt);
-  }
-  return rc;
-}
-
-static int sync_datastore(sr_ctx_t *ctx) {
-  char startup_file[MAX_XPATH] = {0};
-  int rc = SR_ERR_OK;
-  struct stat st;
-
-  /* check if the startup datastore is empty
-   * by checking the content of the file */
-  snprintf(startup_file, MAX_XPATH, "/etc/sysrepo/data/%s.startup", YANG_MODEL);
-
-  if (stat(startup_file, &st) != 0) {
-    ERR("Could not open sysrepo file %s", startup_file);
-    return SR_ERR_INTERNAL;
-  }
-
-  if (0 == st.st_size) {
-    /* parse uci config */
-    INF_MSG("copy uci data to sysrepo");
-    rc = parse_network_config(ctx);
-    CHECK_RET(rc, error, "failed to apply uci data to sysrepo: %s",
-              sr_strerror(rc));
-  } else {
-    /* copy the sysrepo startup datastore to uci */
-    INF_MSG("copy sysrepo data to uci");
-    CHECK_RET(rc, error, "failed to apply sysrepo startup data to snabb: %s",
-              sr_strerror(rc));
-  }
-
-error:
-  return rc;
-}
-
-int sr_plugin_init_cb(sr_session_ctx_t *session, void **private_ctx) {
-  int rc = SR_ERR_OK;
-  sr_ctx_t *ctx = calloc(1, sizeof(*ctx));
-  CHECK_NULL_MSG(ctx, &rc, error, "failed to calloc sr_ctx_t");
-  ctx->data = NULL;
-  ctx->uctx = NULL;
-
-  INF_MSG("sr_plugin_init_cb for sysrepo-plugin-dt-network");
-
-  /* Allocate UCI context for uci files. */
-  ctx->uctx = uci_alloc_context();
-  CHECK_NULL_MSG(ctx->uctx, &rc, error, "failed to uci_alloc_context()");
-
-  ctx->data = calloc(1, sizeof(priv_t));
-  CHECK_NULL_MSG(ctx->data, &rc, error, "failed to calloc priv_t");
-
-  INF_MSG("Connecting to sysrepo ...");
-  rc = sr_connect(SR_CONN_DEFAULT, &ctx->startup_conn);
-  CHECK_RET(rc, error, "Error by sr_connect: %s", sr_strerror(rc));
-
-  rc = sr_session_start(ctx->startup_conn, SR_DS_STARTUP, &ctx->startup_sess);
-  CHECK_RET(rc, error, "Error by sr_session_start: %s", sr_strerror(rc));
-
-  *private_ctx = ctx;
-
-  /* Init type for interface... */
-  rc = sync_datastore(ctx);
-  CHECK_RET(rc, error, "Couldn't initialize datastores: %s", sr_strerror(rc));
-
-  rc = sr_copy_config(ctx->startup_sess, YANG_MODEL, SR_DS_STARTUP,
-                      SR_DS_RUNNING, 0);
-  if (SR_ERR_OK != rc) {
-    WRN_MSG("Failed to copy running datastore to startup");
-    /* TODO handle this error */
-    goto error;
-  }
-
-  INF_MSG("sr_plugin_init_cb for sysrepo-plugin-dt-network");
-  rc =
-      sr_module_change_subscribe(session, YANG_MODEL, NULL, module_change_cb,
-                                 *private_ctx, 0, SR_SUBSCR_DEFAULT, &ctx->sub);
-  CHECK_RET(rc, error, "initialization error: %s", sr_strerror(rc));
-
-  INF("sr_plugin_init_cb for sysrepo-plugin-dt-network %s", sr_strerror(rc));
-
-  /* Operational data handling. */
-  INF_MSG("Subscribing to operational data");
-  rc = sr_oper_get_items_subscribe(
-      session, YANG_MODEL, "/ietf-interfaces:interfaces-state",
-      data_provider_interface_cb, *private_ctx, SR_SUBSCR_CTX_REUSE, &ctx->sub);
-  CHECK_RET(rc, error, "Error by sr_dp_get_items_subscribe: %s",
-            sr_strerror(rc));
-
-  rc = network_operational_start();
-  CHECK_RET(rc, error, "Could not init ubus: %s", sr_strerror(rc));
-
-  DBG_MSG("Plugin initialized successfully");
-  return SR_ERR_OK;
-
-error:
-  SRP_LOG_ERR("Plugin initialization failed: %s", sr_strerror(rc));
-  return rc;
-}
-
-void sr_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_ctx) {
-  INF("Plugin cleanup called, private_ctx is %s available.",
-      private_ctx ? "" : "not");
-  if (!private_ctx)
-    return;
-
-  sr_ctx_t *ctx = private_ctx;
-  if (NULL != ctx->sub) {
-    sr_unsubscribe(ctx->sub);
-  }
-  if (NULL != ctx->startup_sess) {
-    sr_session_stop(ctx->startup_sess);
-  }
-  if (NULL != ctx->startup_conn) {
-    sr_disconnect(ctx->startup_conn);
-  }
-  if (NULL != ctx->uctx) {
-    uci_free_context(ctx->uctx);
-  }
-  network_operational_stop();
-  if (NULL != ctx->data) {
-    free(ctx->data);
-  }
-  free(ctx);
-
-  DBG_MSG("Plugin cleaned-up successfully");
+static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath, srpo_ubus_result_values_t *values, struct lyd_node **parent)
+{
+	const struct ly_ctx *ly_ctx = NULL;
+	if (*parent == NULL) {
+		ly_ctx = sr_get_context(sr_session_get_connection(session));
+		if (ly_ctx == NULL) {
+			return -1;
+		}
+		*parent = lyd_new_path(NULL, ly_ctx, request_xpath, NULL, 0, 0);
+	}
+
+	for (size_t i = 0; i < values->num_values; i++) {
+		lyd_new_path(*parent, NULL, values->values[i].xpath, values->values[i].value, 0, 0);
+	}
+
+	return 0;
 }
 
 #ifndef PLUGIN
@@ -801,46 +627,54 @@ void sr_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_ctx) {
 
 volatile int exit_application = 0;
 
-static void sigint_handler(__attribute__((unused)) int signum) {
-  INF_MSG("Sigint called, exiting...");
-  exit_application = 1;
+static void sigint_handler(__attribute__((unused)) int signum);
+
+int main()
+{
+    	int error = SR_ERR_OK;
+	sr_conn_ctx_t *connection = NULL;
+	sr_session_ctx_t *session = NULL;
+	void *private_data = NULL;
+
+	sr_log_stderr(SR_LL_DBG);
+
+	/* connect to sysrepo */
+	error = sr_connect(SR_CONN_DEFAULT, &connection);
+	if (error) {
+		SRP_LOG_ERR("sr_connect error (%d): %s", error, sr_strerror(error));
+		goto out;
+	}
+
+	error = sr_session_start(connection, SR_DS_RUNNING, &session);
+	if (error) {
+		SRP_LOG_ERR("sr_session_start error (%d): %s", error, sr_strerror(error));
+		goto out;
+	}
+
+	error = network_plugin_init_cb(session, &private_data);
+	if (error) {
+		SRP_LOG_ERRMSG("network_plugin_init_cb error");
+		goto out;
+	}
+
+	/*  loop until ctrl-c is pressed / SIGINT is received */
+	signal(SIGINT, sigint_handler);
+	signal(SIGPIPE, SIG_IGN);
+	while (!exit_application) {
+		sleep(1);
+	}
+
+out:
+	network_plugin_cleanup_cb(session, private_data);
+	sr_disconnect(connection);
+
+	return error ? -1 : 0;
 }
 
-int main() {
-  INF_MSG("Plugin application mode initialized");
-  sr_conn_ctx_t *connection = NULL;
-  sr_session_ctx_t *session = NULL;
-  void *private_ctx = NULL;
-  int rc = SR_ERR_OK;
-
-  /* connect to sysrepo */
-  INF_MSG("Connecting to sysrepo ...");
-  rc = sr_connect(SR_CONN_DEFAULT, &connection);
-  CHECK_RET(rc, cleanup, "Error by sr_connect: %s", sr_strerror(rc));
-
-  /* start session */
-  INF_MSG("Starting session ...");
-  rc = sr_session_start(connection, SR_DS_RUNNING, &session);
-  CHECK_RET(rc, cleanup, "Error by sr_session_start: %s", sr_strerror(rc));
-
-  INF_MSG("Initializing plugin ...");
-  rc = sr_plugin_init_cb(session, &private_ctx);
-  CHECK_RET(rc, cleanup, "Error by sr_plugin_init_cb: %s", sr_strerror(rc));
-
-  /* loop until ctrl-c is pressed / SIGINT is received */
-  signal(SIGINT, sigint_handler);
-  signal(SIGPIPE, SIG_IGN);
-  while (!exit_application) {
-    sleep(1); /* or do some more useful work... */
-  }
-
-cleanup:
-  sr_plugin_cleanup_cb(session, private_ctx);
-  if (NULL != session) {
-    sr_session_stop(session);
-  }
-  if (NULL != connection) {
-    sr_disconnect(connection);
-  }
+static void sigint_handler(__attribute__((unused)) int signum)
+{
+	SRP_LOG_INFMSG("Sigint called, exiting...");
+	exit_application = 1;
 }
+
 #endif
