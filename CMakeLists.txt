@@ -1,29 +1,29 @@
-CMAKE_MINIMUM_REQUIRED(VERSION 2.6)
-set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/CMakeModules/")
-set(PLUGIN 0 CACHE BOOL "Build a plugin.")
+CMAKE_MINIMUM_REQUIRED(VERSION 2.8)
+project(sysrepo-plugin-network C)
 
-PROJECT(sysrepo-plugin-dt-network)
+include(CompileOptions.cmake)
 
+set(PLUGIN 0 CACHE BOOL "Build a plugin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu11 -Wall")
+include_directories(${CMAKE_SOURCE_DIR}/src/)
 
 set(SOURCES
-  src/ubus.c
-  src/openwrt.c
-  src/sr_uci.c
-  src/network.c)
+    src/network.c
+    src/transform_data.c
+    src/utils/memory.c
+  )
 
 # git SHA1 hash
-execute_process(COMMAND
+execute_process(
+  COMMAND
   git describe --always --abbrev=40
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-  OUTPUT_VARIABLE GIT_SHA1
-  ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
-
-# by default set to older version for backward compatibility
-set(SYSREPO_LESS_0_7_5 ON CACHE BOOL "Sysrepo version older than 0.7.5 (< 0.7.5)")
-set(SYSREPO_LESS_0_7_7 ON CACHE BOOL "Sysrepo version older than 0.7.7 (< 0.7.7)")
+  OUTPUT_VARIABLE
+  GIT_SHA1
+  ERROR_QUIET
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
 
 # get sysrepo version
 find_package(PkgConfig)
@@ -32,11 +32,8 @@ if (PKG_CONFIG_FOUND)
     if(SYSREPO_VERSION)
         # strip new line from string
         string(STRIP ${SYSREPO_VERSION} SYSREPO_VERSION)
-        if(${SYSREPO_VERSION} VERSION_GREATER_EQUAL "0.7.5")
-            set(SYSREPO_LESS_0_7_5 OFF)
-        endif()
-        if(${SYSREPO_VERSION} VERSION_GREATER_EQUAL "0.7.7")
-            set(SYSREPO_LESS_0_7_7 OFF)
+        if(${SYSREPO_VERSION} VERSION_LESS "1.0.0")
+            message(FATAL_ERROR "${PROJECT_NAME} requires at least libsysrepo verision 1.0.0")
         endif()
     endif()
 endif()
@@ -54,28 +51,32 @@ endif()
 
 set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${CMAKE_PROJECT_NAME} PREFIX "")
 
-# dependencies - libyang
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} "${CMAKE_SOURCE_DIR}/cmake/Modules")
 find_package(LibYANG REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} ${LIBYANG_LIBRARIES})
-include_directories(${LIBYANG_INCLUDE_DIRS})
-
 find_package(SYSREPO REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} ${SYSREPO_LIBRARIES})
-include_directories(${SYSREPO_INCLUDE_DIRS})
-
 find_package(UCI REQUIRED)
-include_directories(${UCI_INCLUDE_DIR})
-target_link_libraries(${CMAKE_PROJECT_NAME} ${UCI_LIBRARIES})
-
 find_package(LIBUBOX REQUIRED)
-include_directories(${LIBUBOX_INCLUDE_DIR})
-target_link_libraries(${CMAKE_PROJECT_NAME} ${LIBUBOX_LIBRARIES})
-
 find_package(LIBUBUS REQUIRED)
-include_directories(${LIBUBUS_INCLUDE_DIR})
-target_link_libraries(${CMAKE_PROJECT_NAME} ${LIBUBUS_LIBRARIES})
-
-# dependencies - json-c
 find_package(JSON-C REQUIRED)
-include_directories(${JSON-C_INCLUDE_DIR})
-target_link_libraries(${CMAKE_PROJECT_NAME} json-c)
+find_package(SRPO REQUIRED)
+
+target_link_libraries(
+	${PROJECT_NAME}
+	${LIBYANG_LIBRARIES}
+	${SYSREPO_LIBRARIES}
+	${UCI_LIBRARIES}
+	${LIBUBOX_LIBRARIES}
+	${LIBUBUS_LIBRARIES}
+	${JSON-C_LIBRARIES}
+	${SRPO_LIBRARIES}
+	)
+
+include_directories(
+	${LIBYANG_INCLUDE_DIRS}
+	${SYSREPO_INCLUDE_DIRS}
+	${UCI_INCLUDE_DIR}
+	${LIBUBOX_INCLUDE_DIR}
+	${LIBUBUS_INCLUDE_DIR}
+	${JSON-C_INCLUDE_DIR}
+	${SRPO_INCLUDE_DIRS}
+	)
