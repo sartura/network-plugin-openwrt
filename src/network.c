@@ -45,10 +45,10 @@ static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char 
 
 srpo_uci_xpath_uci_template_map_t network_xpath_uci_path_template_map[] = {
 	{NETWORK_INTERFACE_XPATH_TEMPLATE "network.%s", "interface", NULL, NULL, false, false},
-	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/mtu", "network.%s.mtu", NULL, NULL,  NULL, false, false},
+	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/mtu", "network.%s.mtu", NULL, NULL, NULL, false, false},
 	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/mtu", "network.%s.mtu", NULL, NULL, NULL, false, false},
 	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/enabled", "network.%s.enabled", NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
-	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/enabled", "network.%s.enabled",  NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
+	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/enabled", "network.%s.enabled", NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
 };
 
 srpo_uci_xpath_uci_template_map_t network_xpath_uci_path_unnamed_template_map[] = {
@@ -58,7 +58,6 @@ srpo_uci_xpath_uci_template_map_t network_xpath_uci_path_unnamed_template_map[] 
 	{"/ietf-ip:ipv6/address[ip='%s']/prefix-length", "network.%s.ip6prefixlen", NULL, NULL, NULL, false, false},
 	{"/ietf-ip:ipv4/address[ip='%s']/netmask", "network.%s.netmask", NULL, NULL, NULL, false, false},
 };
-
 
 static network_ubus_json_transform_table_t network_transform_table[] = {
 	{.value_name = "type", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/type"},
@@ -148,7 +147,7 @@ int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
 
 error_out:
 	sr_unsubscribe(subscription);
-	
+
 out:
 	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
 }
@@ -164,7 +163,7 @@ static bool network_running_datastore_is_empty_check(void)
 		is_empty = true;
 		goto out;
 	}
-	
+
 	if (fgetc(sysrepocfg_DS_empty_check) == EOF) {
 		is_empty = true;
 	}
@@ -212,7 +211,6 @@ static int network_uci_data_load(sr_session_ctx_t *session)
 				error = srpo_uci_ucipath_to_xpath_convert(uci_path_list[j], template_map, template_map_size, &xpath);
 			} else {
 				error = srpo_uci_sublist_ucipath_to_xpath_convert(uci_path_list[j], NETWORK_INTERFACE_XPATH_TEMPLATE, "network.%s", template_map, template_map_size, &xpath);
-				error = NULL;
 			}
 
 			if (error && error != SRPO_UCI_ERR_NOT_FOUND) {
@@ -224,7 +222,7 @@ static int network_uci_data_load(sr_session_ctx_t *session)
 			}
 
 			error = srpo_uci_transform_uci_data_cb_get(uci_path_list[j], template_map, template_map_size,
-								   &transform_uci_data_cb);
+													   &transform_uci_data_cb);
 			if (error) {
 				SRP_LOG_ERR("srpo_uci_transfor_uci_data_cb_get error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
@@ -352,17 +350,17 @@ static int network_module_change_cb(sr_session_ctx_t *session, const char *modul
 	if (event == SR_EV_CHANGE) {
 		error = sr_get_changes_iter(session, xpath, &network_server_change_iter);
 		if (error) {
-		SRP_LOG_ERR("sr_get_changes_iter error (%d): %s", error, sr_strerror(error));
-		goto error_out;
+			SRP_LOG_ERR("sr_get_changes_iter error (%d): %s", error, sr_strerror(error));
+			goto error_out;
 		}
 
 		while (sr_get_change_tree_next(session, network_server_change_iter, &operation, &node, &prev_value, &prev_list, &prev_default) == SR_ERR_OK) {
 			node_xpath = network_xpath_get(node);
 			error = srpo_uci_xpath_to_ucipath_convert(node_xpath, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &uci_path);
 			if (error && error != SRPO_UCI_ERR_NOT_FOUND) {
-			SRP_LOG_ERR("srpo_uci_xpath_to_ucipath_convert error (%d): %s", error, srpo_uci_error_description_get(error));
-			goto error_out;
-			}  else if (error == SRPO_UCI_ERR_NOT_FOUND) {
+				SRP_LOG_ERR("srpo_uci_xpath_to_ucipath_convert error (%d): %s", error, srpo_uci_error_description_get(error));
+				goto error_out;
+			} else if (error == SRPO_UCI_ERR_NOT_FOUND) {
 				error = 0;
 				SRP_LOG_DBG("xpath %s not found in table", node_xpath);
 				FREE_SAFE(node_xpath);
@@ -527,7 +525,7 @@ static int network_state_data_cb(sr_session_ctx_t *session, const char *module_n
 				goto out;
 			}
 		}
-/*
+		/*
 		ubus_call_data.lookup_path = "router.net";
 		ubus_call_data.method = "arp";
 		error = srpo_ubus_call(values, &ubus_call_data);
@@ -562,7 +560,7 @@ static int network_state_data_cb(sr_session_ctx_t *session, const char *module_n
 		}
 		srpo_ubus_free_result_values(values);
 		values = NULL;
-		}
+	}
 
 out:
 	if (values) {
@@ -591,7 +589,7 @@ static void network_ubus(const char *ubus_json, srpo_ubus_result_values_t *value
 
 			value_string = json_object_get_string(child_value);
 
-			error = srpo_ubus_result_values_add(values, value_string, strlen(value_string),network_transform_table[i].xpath_template,strlen(network_transform_table[i].xpath_template),key, strlen(key));
+			error = srpo_ubus_result_values_add(values, value_string, strlen(value_string), network_transform_table[i].xpath_template, strlen(network_transform_table[i].xpath_template), key, strlen(key));
 			if (error != SRPO_UBUS_ERR_OK) {
 				goto cleanup;
 			}
@@ -600,7 +598,7 @@ static void network_ubus(const char *ubus_json, srpo_ubus_result_values_t *value
 
 cleanup:
 	json_object_put(result);
-	return ;
+	return;
 }
 
 static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath, srpo_ubus_result_values_t *values, struct lyd_node **parent)
@@ -631,7 +629,7 @@ static void sigint_handler(__attribute__((unused)) int signum);
 
 int main()
 {
-    	int error = SR_ERR_OK;
+	int error = SR_ERR_OK;
 	sr_conn_ctx_t *connection = NULL;
 	sr_session_ctx_t *session = NULL;
 	void *private_data = NULL;

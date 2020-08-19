@@ -41,4 +41,3 @@ char *transform_data_zero_one_to_boolean_negated_transform(const char *value, vo
 		return xstrdup("true");
 	}
 }
-

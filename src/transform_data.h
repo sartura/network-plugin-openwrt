@@ -34,5 +34,4 @@ char *transform_data_zero_one_to_boolean_transform(const char *value, void *priv
 char *transform_data_boolean_to_zero_one_negated_transform(const char *value, void *private_data);
 char *transform_data_zero_one_to_boolean_negated_transform(const char *value, void *private_data);
 
-
 #endif /*  TRANSFORM_DATA_H_ONCE */
