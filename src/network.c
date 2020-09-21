@@ -36,9 +36,6 @@ typedef struct {
 const char *IPADDR_UCI_TEMPLATE = "network.%s.ipaddr";
 const char *IP6ADDR_UCI_TEMPLATE = "network.%s.ip6addr";
 
-int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data);
-void network_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data);
-
 static int network_module_change_cb(sr_session_ctx_t *session, const char *module_name,
 									const char *xpath, sr_event_t event, uint32_t request_id,
 									void *private_data);
@@ -96,7 +93,7 @@ static struct {
 	{"network", network_uci_sections, ARRAY_SIZE(network_uci_sections)},
 };
 
-int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
+int sr_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
 {
 	int error = 0;
 	sr_conn_ctx_t *connection = NULL;
@@ -293,7 +290,7 @@ out:
 	return error ? -1 : 0;
 }
 
-void network_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data)
+void sr_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data)
 {
 	srpo_uci_cleanup();
 
@@ -668,9 +665,9 @@ int main()
 		goto out;
 	}
 
-	error = network_plugin_init_cb(session, &private_data);
+	error = sr_plugin_init_cb(session, &private_data);
 	if (error) {
-		SRP_LOG_ERRMSG("network_plugin_init_cb error");
+		SRP_LOG_ERRMSG("sr_plugin_init_cb error");
 		goto out;
 	}
 
@@ -682,7 +679,7 @@ int main()
 	}
 
 out:
-	network_plugin_cleanup_cb(session, private_data);
+	sr_plugin_cleanup_cb(session, private_data);
 	sr_disconnect(connection);
 
 	return error ? -1 : 0;
