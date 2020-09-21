@@ -19,8 +19,10 @@
 
 #define NETWORK_YANG_MODEL "ietf-interfaces"
 #define SYSREPOCFG_EMPTY_CHECK_COMMAND "sysrepocfg -X -d running -m " NETWORK_YANG_MODEL
-#define NETWORK_INTERFACE_XPATH_TEMPLATE "/" NETWORK_YANG_MODEL ":interfaces/interface[name='%s']"
-#define NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/" NETWORK_YANG_MODEL ":interfaces-state"
+
+#define INTERFACES_YANG_PATH "/" NETWORK_YANG_MODEL ":interfaces"
+#define INTERFACES_STATE_YANG_PATH "/" NETWORK_YANG_MODEL ":interfaces-state"
+#define INTERFACE_XPATH_TEMPLATE INTERFACES_YANG_PATH "/interface[name='%s']"
 
 typedef char *(*transform_data_cb)(const char *);
 
@@ -28,60 +30,70 @@ typedef struct {
 	const char *value_name;
 	const char *xpath_template;
 	transform_data_cb transform_data;
+
 } network_ubus_json_transform_table_t;
+
+const char *IPADDR_UCI_TEMPLATE = "network.%s.ipaddr";
+const char *IP6ADDR_UCI_TEMPLATE = "network.%s.ip6addr";
 
 int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data);
 void network_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data);
 
-static int network_module_change_cb(sr_session_ctx_t *session, const char *module_name, const char *xpath, sr_event_t event, uint32_t request_id, void *private_data);
-static int network_state_data_cb(sr_session_ctx_t *session, const char *module_name, const char *path, const char *request_xpath, uint32_t request_id, struct lyd_node **parent, void *private_data);
+static int network_module_change_cb(sr_session_ctx_t *session, const char *module_name,
+									const char *xpath, sr_event_t event, uint32_t request_id,
+									void *private_data);
+static int network_state_data_cb(sr_session_ctx_t *session, const char *module_name,
+								 const char *path, const char *request_xpath, uint32_t request_id,
+								 struct lyd_node **parent, void *private_data);
+
+static int transform_path_address_cb(const char *target, const char *from, const char *to,
+									 srpo_uci_path_direction_t direction, char **path);
 
 static bool network_running_datastore_is_empty_check(void);
 static int network_uci_data_load(sr_session_ctx_t *session);
 static char *network_xpath_get(const struct lyd_node *node);
 
-static void network_ubus(const char *ubus_json, srpo_ubus_result_values_t *values);
-static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath, srpo_ubus_result_values_t *values, struct lyd_node **parent);
+static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath,
+										  srpo_ubus_result_values_t *values, struct lyd_node **parent);
 
 srpo_uci_xpath_uci_template_map_t network_xpath_uci_path_template_map[] = {
-	{NETWORK_INTERFACE_XPATH_TEMPLATE "network.%s", "interface", NULL, NULL, false, false},
-	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/mtu", "network.%s.mtu", NULL, NULL, NULL, false, false},
-	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/mtu", "network.%s.mtu", NULL, NULL, NULL, false, false},
-	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/enabled", "network.%s.enabled", NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
-	{NETWORK_INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/enabled", "network.%s.enabled", NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
-};
+	{INTERFACE_XPATH_TEMPLATE, "network.%s", "interface", NULL, NULL, NULL, false, false},
+	{INTERFACE_XPATH_TEMPLATE "/type", "network.%s.proto", NULL,
+	 NULL, transform_data_interface_type_to_null_transform, transform_data_null_to_interface_type_transform, true, true},
 
-srpo_uci_xpath_uci_template_map_t network_xpath_uci_path_unnamed_template_map[] = {
-	{"/ietf-ip:ipv4/address[ip='%s']/ip", "network.%s.ipaddr", NULL, NULL, NULL, false, false},
-	{"/ietf-ip:ipv6/address[ip='%s']/ip", "network.%s.ip6addr", NULL, NULL, NULL, false, false},
-	{"/ietf-ip:ipv4/address[ip='%s']/prefix-length", "network.%s.ip4prefixlen", NULL, NULL, NULL, false, false},
-	{"/ietf-ip:ipv6/address[ip='%s']/prefix-length", "network.%s.ip6prefixlen", NULL, NULL, NULL, false, false},
-	{"/ietf-ip:ipv4/address[ip='%s']/netmask", "network.%s.netmask", NULL, NULL, NULL, false, false},
-};
+	{INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/mtu", "network.%s.mtu", NULL, NULL, NULL, NULL, false, false},
+	{INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/enabled", "network.%s.enabled", NULL,
+	 NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
 
-static network_ubus_json_transform_table_t network_transform_table[] = {
-	{.value_name = "type", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/type"},
-	{.value_name = "admin-status", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/admin-status"},
-	{.value_name = "oper-status", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/oper_status"},
-	{.value_name = "last-change", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/last-change"},
-	{.value_name = "if-index", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/if-index"},
-	{.value_name = "phys-address", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/phys-address"},
-	{.value_name = "speed", .xpath_template = NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE "/speed"},
+	{INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/mtu", "network.%s.mtu", NULL, NULL, NULL, NULL, false, false},
+	{INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/enabled", "network.%s.enabled", NULL,
+	 NULL, transform_data_boolean_to_zero_one_transform, transform_data_zero_one_to_boolean_transform, true, true},
+
+	{INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/address[ip='%s']/ip", "network.%s.ipaddr", NULL,
+	 transform_path_address_cb, NULL, NULL, false, false},
+	/* netmask leaf is dependent on the `ipv4-non-contiguous-netmasks` feature */
+	{INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/address[ip='%s']/prefix-length", "network.%s.netmask", NULL,
+	 transform_path_address_cb,
+	 transform_data_ipv4_prefixlen_to_netmask_transform, transform_data_ipv4_netmask_to_prefixlen_transform, true, true},
+	{INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv4/address[ip='%s']/prefix-length", "network.%s.ip4prefixlen", NULL,
+	 transform_path_address_cb, NULL, NULL, false, false},
+
+	// {INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/address[ip='%s']/ip", "network.%s.ip6addr", NULL,
+	//  transform_path_address_cb, transform_data_ipv6_add_prefixlen_transform, transform_data_ipv6_strip_prefixlen_transform, true, true},
+	// {INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/address[ip='%s']/prefix-length", "network.%s.ip6addr", NULL,
+	//  transform_path_address_cb, transform_data_ipv6_add_ip_transform, transform_data_ipv6_strip_ip_transform, true, true},
+	// {INTERFACE_XPATH_TEMPLATE "/ietf-ip:ipv6/address[ip='%s']/prefix-length", "network.%s.ip6prefixlen", NULL,
+	//  transform_path_address_cb, NULL, NULL, false, false},
 };
 
 static const char *network_uci_sections[] = {"interface"};
-static const char *network_uci_unnamed_sections[] = {"interface"};
-static const char *network_ubus_object_paths[] = {"network.device", "network.interface", "network.interface", "sfp.ddm", "router.net", "router.net"};
-static const char *network_ubus_object_methods[] = {"status", "status", "dump", "get-all", "arp", "ipv6-neigh"};
 
 static struct {
 	const char *uci_file;
 	const char **uci_section_list;
 	size_t uci_section_list_size;
-	bool convert_unnamed_sections;
 } network_config_files[] = {
-	{"network", network_uci_sections, ARRAY_SIZE(network_uci_sections), true},
-	{"network", network_uci_unnamed_sections, ARRAY_SIZE(network_uci_unnamed_sections), false},
+	{"network", network_uci_sections, ARRAY_SIZE(network_uci_sections)},
 };
 
 int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
@@ -127,7 +139,8 @@ int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
 	}
 
 	SRP_LOG_INFMSG("subscribing to module change");
-	error = sr_module_change_subscribe(session, NETWORK_YANG_MODEL, "/" NETWORK_YANG_MODEL ":*//* ", network_module_change_cb, *private_data, 0, SR_SUBSCR_DEFAULT, &subscription);
+	error = sr_module_change_subscribe(session, NETWORK_YANG_MODEL, "/" NETWORK_YANG_MODEL ":*//*",
+									   network_module_change_cb, *private_data, 0, SR_SUBSCR_DEFAULT, &subscription);
 	if (error) {
 		SRP_LOG_ERR("sr_module_change_subscribe error (%d): %s", error, sr_strerror(error));
 		goto error_out;
@@ -135,7 +148,8 @@ int network_plugin_init_cb(sr_session_ctx_t *session, void **private_data)
 
 	SRP_LOG_INFMSG("subscribing to get oper items");
 
-	error = sr_oper_get_items_subscribe(session, NETWORK_YANG_MODEL, "/ietf-interfaces:interfaces-state", network_state_data_cb, NULL, SR_SUBSCR_CTX_REUSE, &subscription);
+	error = sr_oper_get_items_subscribe(session, NETWORK_YANG_MODEL, INTERFACES_STATE_YANG_PATH,
+										network_state_data_cb, *private_data, SR_SUBSCR_CTX_REUSE, &subscription);
 	if (error) {
 		SRP_LOG_ERR("sr_oper_get_items_subscribe error (%d): %s", error, sr_strerror(error));
 		goto error_out;
@@ -187,32 +201,20 @@ static int network_uci_data_load(sr_session_ctx_t *session)
 	char *uci_section_name = NULL;
 	char **uci_value_list = NULL;
 	size_t uci_value_list_size = 0;
-	srpo_uci_xpath_uci_template_map_t *template_map = NULL;
-	size_t template_map_size = 0;
 
 	for (size_t i = 0; i < ARRAY_SIZE(network_config_files); i++) {
-
-		if (network_config_files[i].convert_unnamed_sections) {
-			template_map = network_xpath_uci_path_template_map;
-			template_map_size = ARRAY_SIZE(network_xpath_uci_path_template_map);
-		} else {
-			template_map = network_xpath_uci_path_unnamed_template_map;
-			template_map_size = ARRAY_SIZE(network_xpath_uci_path_unnamed_template_map);
-		}
-
-		error = srpo_uci_ucipath_list_get(network_config_files[i].uci_file, network_config_files[i].uci_section_list, network_config_files[i].uci_section_list_size, &uci_path_list, &uci_path_list_size, network_config_files[i].convert_unnamed_sections);
+		error = srpo_uci_ucipath_list_get(network_config_files[i].uci_file,
+										  network_config_files[i].uci_section_list,
+										  network_config_files[i].uci_section_list_size,
+										  &uci_path_list, &uci_path_list_size, true);
 		if (error) {
 			SRP_LOG_ERR("srpo_uci_path_list_get error (%d): %s", error, srpo_uci_error_description_get(error));
 			goto error_out;
 		}
 
 		for (size_t j = 0; j < uci_path_list_size; j++) {
-			if (network_config_files[i].convert_unnamed_sections) {
-				error = srpo_uci_ucipath_to_xpath_convert(uci_path_list[j], template_map, template_map_size, &xpath);
-			} else {
-				error = srpo_uci_sublist_ucipath_to_xpath_convert(uci_path_list[j], NETWORK_INTERFACE_XPATH_TEMPLATE, "network.%s", template_map, template_map_size, &xpath);
-			}
-
+			error = srpo_uci_ucipath_to_xpath_convert(uci_path_list[j], network_xpath_uci_path_template_map,
+													  ARRAY_SIZE(network_xpath_uci_path_template_map), &xpath);
 			if (error && error != SRPO_UCI_ERR_NOT_FOUND) {
 				SRP_LOG_ERR("srpo_uci_to_xpath_path_convert error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
@@ -221,14 +223,17 @@ static int network_uci_data_load(sr_session_ctx_t *session)
 				continue;
 			}
 
-			error = srpo_uci_transform_uci_data_cb_get(uci_path_list[j], template_map, template_map_size,
+			error = srpo_uci_transform_uci_data_cb_get(uci_path_list[j], network_xpath_uci_path_template_map,
+													   ARRAY_SIZE(network_xpath_uci_path_template_map),
 													   &transform_uci_data_cb);
 			if (error) {
 				SRP_LOG_ERR("srpo_uci_transfor_uci_data_cb_get error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
 			}
 
-			error = srpo_uci_has_transform_uci_data_private_get(uci_path_list[j], template_map, template_map_size, &has_transform_uci_data_private);
+			error = srpo_uci_has_transform_uci_data_private_get(uci_path_list[j], network_xpath_uci_path_template_map,
+																ARRAY_SIZE(network_xpath_uci_path_template_map),
+																&has_transform_uci_data_private);
 			if (error) {
 				SRP_LOG_ERR("srpo_uci_has_transform_uci_data_private_get error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
@@ -236,7 +241,9 @@ static int network_uci_data_load(sr_session_ctx_t *session)
 
 			uci_section_name = srpo_uci_section_name_get(uci_path_list[j]);
 
-			error = srpo_uci_element_value_get(uci_path_list[j], transform_uci_data_cb, has_transform_uci_data_private ? uci_section_name : NULL, &uci_value_list, &uci_value_list_size);
+			error = srpo_uci_element_value_get(uci_path_list[j], transform_uci_data_cb,
+											   has_transform_uci_data_private ? uci_section_name : NULL,
+											   &uci_value_list, &uci_value_list_size);
 			if (error) {
 				SRP_LOG_ERR("srpo_uci_element_value_get error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
@@ -255,17 +262,6 @@ static int network_uci_data_load(sr_session_ctx_t *session)
 			FREE_SAFE(uci_section_name);
 			FREE_SAFE(uci_path_list[j]);
 			FREE_SAFE(xpath);
-		}
-
-		/*
-		 * FIXME: libuci otherwise checks the context for existing file
-		 * in `uci_switch_config` and throws `UCI_ERR_DUPLICATE`.
-		 */
-		srpo_uci_cleanup();
-		error = srpo_uci_init();
-		if (error) {
-			SRP_LOG_ERR("srpo_uci_init error (%d): %s", error, srpo_uci_error_description_get(error));
-			goto error_out;
 		}
 	}
 
@@ -310,7 +306,9 @@ void network_plugin_cleanup_cb(sr_session_ctx_t *session, void *private_data)
 	SRP_LOG_INFMSG("plugin cleanup finished");
 }
 
-static int network_module_change_cb(sr_session_ctx_t *session, const char *module_name, const char *xpath, sr_event_t event, uint32_t request_id, void *private_data)
+static int network_module_change_cb(sr_session_ctx_t *session, const char *module_name,
+									const char *xpath, sr_event_t event, uint32_t request_id,
+									void *private_data)
 {
 	int error = 0;
 	sr_session_ctx_t *startup_session = (sr_session_ctx_t *) private_data;
@@ -354,9 +352,14 @@ static int network_module_change_cb(sr_session_ctx_t *session, const char *modul
 			goto error_out;
 		}
 
-		while (sr_get_change_tree_next(session, network_server_change_iter, &operation, &node, &prev_value, &prev_list, &prev_default) == SR_ERR_OK) {
+		while (sr_get_change_tree_next(session, network_server_change_iter, &operation, &node,
+									   &prev_value, &prev_list, &prev_default) == SR_ERR_OK) {
 			node_xpath = network_xpath_get(node);
-			error = srpo_uci_xpath_to_ucipath_convert(node_xpath, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &uci_path);
+
+			error = srpo_uci_xpath_to_ucipath_convert(node_xpath,
+													  network_xpath_uci_path_template_map,
+													  ARRAY_SIZE(network_xpath_uci_path_template_map),
+													  &uci_path);
 			if (error && error != SRPO_UCI_ERR_NOT_FOUND) {
 				SRP_LOG_ERR("srpo_uci_xpath_to_ucipath_convert error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
@@ -367,13 +370,19 @@ static int network_module_change_cb(sr_session_ctx_t *session, const char *modul
 				continue;
 			}
 
-			error = srpo_uci_transform_sysrepo_data_cb_get(node_xpath, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &transform_sysrepo_data_cb);
+			error = srpo_uci_transform_sysrepo_data_cb_get(node_xpath,
+														   network_xpath_uci_path_template_map,
+														   ARRAY_SIZE(network_xpath_uci_path_template_map),
+														   &transform_sysrepo_data_cb);
 			if (error) {
 				SRP_LOG_ERR("srpo_uci_transfor_sysrepo_data_cb_get error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
 			}
 
-			error = srpo_uci_has_transform_sysrepo_data_private_get(node_xpath, network_xpath_uci_path_template_map, ARRAY_SIZE(network_xpath_uci_path_template_map), &has_transform_sysrepo_data_private);
+			error = srpo_uci_has_transform_sysrepo_data_private_get(node_xpath,
+																	network_xpath_uci_path_template_map,
+																	ARRAY_SIZE(network_xpath_uci_path_template_map),
+																	&has_transform_sysrepo_data_private);
 			if (error) {
 				SRP_LOG_ERR("srpo_uci_has_transform_sysrepo_data_private_get error (%d): %s", error, srpo_uci_error_description_get(error));
 				goto error_out;
@@ -414,10 +423,7 @@ static int network_module_change_cb(sr_session_ctx_t *session, const char *modul
 				}
 			} else if (node->schema->nodetype == LYS_LEAF) {
 				if (operation == SR_OP_CREATED || operation == SR_OP_MODIFIED) {
-					if (has_transform_sysrepo_data_private && strstr(node_xpath, "stop")) {
-						transform_cb_data = (void *) &(leasetime_data_t){.uci_section_name = uci_section_name, .sr_session = session};
-
-					} else if (has_transform_sysrepo_data_private) {
+					if (has_transform_sysrepo_data_private) {
 						transform_cb_data = uci_section_name;
 					} else {
 						transform_cb_data = NULL;
@@ -506,102 +512,115 @@ static char *network_xpath_get(const struct lyd_node *node)
 	}
 }
 
-static int network_state_data_cb(sr_session_ctx_t *session, const char *module_name, const char *path, const char *request_xpath, uint32_t request_id, struct lyd_node **parent, void *private_data)
+static int network_state_data_cb(sr_session_ctx_t *session, const char *module_name,
+								 const char *path, const char *request_xpath, uint32_t request_id,
+								 struct lyd_node **parent, void *private_data)
 {
-	srpo_ubus_result_values_t *values = NULL;
-	srpo_ubus_call_data_t ubus_call_data = {.lookup_path = NULL, .method = NULL, .transform_data_cb = network_ubus, .timeout = 0, .json_call_arguments = NULL};
-	int error = SRPO_UBUS_ERR_OK;
-
-	if (!strcmp(path, NETWORK_INTERFACES_STATE_DATA_XPATH_TEMPLATE) || !strcmp(path, "*")) {
-		srpo_ubus_init_result_values(&values);
-
-		for (size_t i = 0; i < ARRAY_SIZE(network_ubus_object_methods); i++) {
-			ubus_call_data.lookup_path = network_ubus_object_methods[i];
-			ubus_call_data.method = network_ubus_object_paths[i];
-
-			error = srpo_ubus_call(values, &ubus_call_data);
-			if (error != SRPO_UBUS_ERR_OK) {
-				SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
-				goto out;
-			}
-		}
-		/*
-		ubus_call_data.lookup_path = "router.net";
-		ubus_call_data.method = "arp";
-		error = srpo_ubus_call(values, &ubus_call_data);
-		if (error != SRPO_UBUS_ERR_OK) {
-			FILE *arptable = NULL;
-			char line[512];
-			json_object *;
-
-			arptable = fopen("/proc/net/arp", "r");
-			json_arptable = json_object_from_file(arptable);
-
-			while (fgets(line, sizeof(line), arptable) != NULL) {
-				json_object_string
-			}
-			fclose(arptable);
-
-			SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
-		}
-
-		ubus_call_data.method = "ipv6-neigh";
-		error = srpo_ubus_call(values, &ubus_call_data);
-		if (error != SRPO_UBUS_ERR_OK) {
-			//TODO openwrt_ipv6_neigh
-			SRP_LOG_ERR("srpo_ubus_call error (%d): %s", error, srpo_ubus_error_description_get(error));
-			goto out;
-		}
-*/
-		error = store_ubus_values_to_datastore(session, request_xpath, values, parent);
-		if (error) {
-			SRP_LOG_ERR("store_ubus_values_to_datastore error (%d)", error);
-			goto out;
-		}
-		srpo_ubus_free_result_values(values);
-		values = NULL;
-	}
-
-out:
-	if (values) {
-		srpo_ubus_free_result_values(values);
-	}
-
-	return error ? SR_ERR_CALLBACK_FAILED : SR_ERR_OK;
+	return SR_ERR_CALLBACK_FAILED;
 }
 
-static void network_ubus(const char *ubus_json, srpo_ubus_result_values_t *values)
+static int transform_path_address_cb(const char *target, const char *from, const char *to,
+									 srpo_uci_path_direction_t direction, char **path)
 {
-	json_object *result = NULL;
-	json_object *child_value = NULL;
-	const char *value_string = NULL;
-	srpo_ubus_error_e error = SRPO_UBUS_ERR_OK;
+	int error = SRPO_UCI_ERR_ARGUMENT;
+	char *path_key_value = NULL;
+	char **uci_value_list = NULL;
+	size_t uci_value_list_size = 0;
+	char *ipaddr_uci_key = NULL;
+	size_t ipaddr_uci_key_size = 0;
+	char *path_tmp = NULL;
+	size_t path_tmp_size = 0;
+	const char *ipaddr_template = NULL;
 
-	result = json_tokener_parse(ubus_json);
+	if (from == NULL || to == NULL)
+		goto cleanup;
 
-	json_object_object_foreach(result, key, value)
-	{
-		for (size_t i = 0; i < ARRAY_SIZE(network_transform_table); i++) {
-			json_object_object_get_ex(value, network_transform_table[i].value_name, &child_value);
-			if (child_value == NULL) {
-				goto cleanup;
-			}
+	if (direction == SRPO_UCI_PATH_DIRECTION_UCI) {
+		path_key_value = srpo_uci_xpath_key_value_get(target, 1);
+		ipaddr_uci_key = srpo_uci_xpath_key_value_get(target, 2);
 
-			value_string = json_object_get_string(child_value);
+		path_tmp_size = (strlen(from) - 4 + 1) + strlen(path_key_value) + strlen(ipaddr_uci_key);
+		path_tmp = xmalloc(path_tmp_size);
+		snprintf(path_tmp, path_tmp_size, from, path_key_value, ipaddr_uci_key);
 
-			error = srpo_ubus_result_values_add(values, value_string, strlen(value_string), network_transform_table[i].xpath_template, strlen(network_transform_table[i].xpath_template), key, strlen(key));
-			if (error != SRPO_UBUS_ERR_OK) {
-				goto cleanup;
-			}
+		if (strcmp(target, path_tmp) != 0) {
+			error = SRPO_UCI_ERR_NOT_FOUND;
+			goto cleanup;
 		}
+
+		FREE_SAFE(path_tmp);
+		path_tmp = NULL;
+		path_tmp_size = 0;
+
+		path_tmp_size = (strlen(to) - 2 + 1) + strlen(path_key_value);
+		path_tmp = xmalloc(path_tmp_size);
+		snprintf(path_tmp, path_tmp_size, to, path_key_value);
+
+		*path = xstrdup(path_tmp);
+
+		error = SRPO_UCI_ERR_OK;
+		goto cleanup;
+	} else if (direction == SRPO_UCI_PATH_DIRECTION_XPATH) {
+		path_key_value = srpo_uci_section_name_get(target);
+
+		path_tmp_size = (strlen(from) - 2 + 1) + strlen(path_key_value);
+		path_tmp = xmalloc(path_tmp_size);
+		snprintf(path_tmp, path_tmp_size, from, path_key_value);
+
+		if (strcmp(target, path_tmp) != 0) {
+			error = SRPO_UCI_ERR_NOT_FOUND;
+			goto cleanup;
+		}
+
+		FREE_SAFE(path_tmp);
+		path_tmp = NULL;
+		path_tmp_size = 0;
+
+		ipaddr_template = strstr(to, "ipv6") != NULL ? IP6ADDR_UCI_TEMPLATE : IPADDR_UCI_TEMPLATE;
+
+		ipaddr_uci_key_size = (strlen(ipaddr_template) - 2 + 1) + strlen(path_key_value);
+		ipaddr_uci_key = xmalloc(ipaddr_uci_key_size);
+		snprintf(ipaddr_uci_key, ipaddr_uci_key_size, IPADDR_UCI_TEMPLATE, path_key_value);
+
+		error = srpo_uci_element_value_get(ipaddr_uci_key, NULL, NULL, &uci_value_list, &uci_value_list_size);
+		if (error || uci_value_list_size != 1) {
+			error = SRPO_UCI_ERR_UCI;
+			goto cleanup;
+		}
+
+		FREE_SAFE(ipaddr_uci_key);
+		ipaddr_uci_key = xstrdup(uci_value_list[0]);
+
+		path_tmp_size = (strlen(to) - 2 + 1) + strlen(path_key_value) + strlen(ipaddr_uci_key);
+		path_tmp = xmalloc(path_tmp_size);
+		snprintf(path_tmp, path_tmp_size, to, path_key_value, ipaddr_uci_key);
+
+		*path = xstrdup(path_tmp);
+
+		error = SRPO_UCI_ERR_OK;
+		goto cleanup;
+	} else {
+		error = SRPO_UCI_ERR_ARGUMENT;
+		goto cleanup;
 	}
+
+	error = SRPO_UCI_ERR_NOT_FOUND;
 
 cleanup:
-	json_object_put(result);
-	return;
+	for (size_t i = 0; i < uci_value_list_size; i++) {
+		FREE_SAFE(uci_value_list[i]);
+	}
+	FREE_SAFE(uci_value_list);
+
+	FREE_SAFE(ipaddr_uci_key);
+	FREE_SAFE(path_key_value);
+	FREE_SAFE(path_tmp);
+
+	return error;
 }
 
-static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath, srpo_ubus_result_values_t *values, struct lyd_node **parent)
+static int store_ubus_values_to_datastore(sr_session_ctx_t *session, const char *request_xpath,
+										  srpo_ubus_result_values_t *values, struct lyd_node **parent)
 {
 	const struct ly_ctx *ly_ctx = NULL;
 	if (*parent == NULL) {
