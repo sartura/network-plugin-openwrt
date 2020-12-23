@@ -1,2 +1,5 @@
 build
 src/version.h
+.vscode/
+.clangd/
+compile_commands.json
